@@ -1,0 +1,23 @@
+# Secretos: un plugin no los lleva nunca. Si un sitio exige sesión, se obtiene en
+# tiempo de ejecución y no se persiste.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+id_rsa*
+.netrc
+.npmrc
+.git-credentials
+
+# Salidas de herramientas y temporales
+node_modules/
+*.log
+.tmp/
+
+# Editores y sistema operativo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
