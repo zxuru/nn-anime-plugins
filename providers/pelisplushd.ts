@@ -67,6 +67,16 @@ const TIMEOUT_RESOLUTOR_MS = 20_000
 /** Intentos de la prueba de trabajo. El mismo tope que usa `ani-cli-mx-core`. */
 const POW_LIMITE = 200_000
 
+/**
+ * La dificultad máxima que se acepta del embed.
+ *
+ * La elige el sitio y decide cuántos ceros hay que encontrar: ocho ceros
+ * hexadecimales son 4 300 millones de intentos de media y ningún embed los pide
+ * de verdad. Sin este tope, un `POW_DIFFICULTY` absurdo hace que `'0'.repeat`
+ * intente reservar gigabytes en el proceso que sirve la aplicación.
+ */
+const DIFICULTAD_MAXIMA = 8
+
 /** El alfabeto de los índices del empaquetador, en el orden en que los lee. */
 const DIGITOS = '0123456789abcdefghijklmnopqrstuvwxyz'
 
@@ -117,6 +127,150 @@ function base(): string {
     // se ignora y se sigue con la de fábrica.
     return BASE_POR_DEFECTO
   }
+}
+
+// ---------------------------------------------------------------------------
+// Guardas de red, de credenciales y de tamaño
+// ---------------------------------------------------------------------------
+
+/**
+ * Credenciales que viajan dentro de una dirección.
+ *
+ * El motor que carga este plugin redacta **por nombre de clave**, así que una
+ * credencial metida dentro de una cadena no la ve nadie más que quien la escribe:
+ * el testigo de un espejo o la firma de un manifiesto acabarían en el mensaje de
+ * un fallo y de ahí a una captura de pantalla. Se quitan aquí, que es el único
+ * sitio que construye ese texto.
+ */
+const CREDENCIAL_EN_URL = /([?&](?:api_key|apikey|key|token|expires|asn|signature|sig|hash|auth)=)[^&#\s]*/gi
+
+function sinCredenciales(url: string): string {
+  return url.replace(CREDENCIAL_EN_URL, '$1[redactado]')
+}
+
+/**
+ * Destinos que un reproductor de internet no necesita y una página hostil sí.
+ *
+ * La dirección de la siguiente petición la elige el contenido del sitio —el
+ * `<iframe>` del reproductor, el enlace que sale del embudo, el espejo—, así que
+ * sin esta guarda una página comprometida puede hacer que el plugin pida
+ * `http://127.0.0.1:8080/…`, un servicio de la red de casa o la metadata de la
+ * nube, desde la máquina de quien lo copia. El proxy del motor tiene su propia
+ * comprobación de destinos, pero no cubre estas peticiones: el plugin no pasa por
+ * él.
+ *
+ * Es una comprobación **literal**, aunque `new URL` normaliza las formas raras de
+ * escribir una dirección (`127.1`, `2130706433`, `0x7f.1`) y por eso no se
+ * escapan. Un nombre que resuelva a una dirección interna sí la esquiva: resolver
+ * y fijar la dirección no está al alcance de un `fetch`, y por eso la guarda
+ * completa vive en el motor, que resuelve y mira todas las respuestas del DNS.
+ */
+const HOST_INTERNO =
+  /^(?:(?:[\w-]+\.)+(?:localhost|local|internal|home\.arpa)\.?|localhost\.?|0\.0\.0\.0|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3})$/i
+
+/**
+ * Si un anfitrión es de la red interna.
+ *
+ * Un literal IPv6 se rechaza entero: no aparece en la dirección de un
+ * reproductor, y las formas que envuelven una IPv4 —la mapeada `::ffff:7f00:1`,
+ * la de NAT64, la de 6to4— son justo las que se escapan de una lista literal.
+ */
+function esHostInterno(hostname: string): boolean {
+  return hostname.includes(':') || HOST_INTERNO.test(hostname)
+}
+
+/** Si el propio sitio configurado vive en la red interna. */
+function baseEsInterna(): boolean {
+  try {
+    return esHostInterno(new URL(base()).hostname)
+  } catch {
+    return false
+  }
+}
+
+/** Si la dirección la eligió el contenido del sitio, ¿se puede pedir? */
+function destinoDeContenidoAceptable(url: string): boolean {
+  let analizada: URL
+  try {
+    analizada = new URL(url)
+  } catch {
+    return false
+  }
+
+  if (analizada.protocol !== 'http:' && analizada.protocol !== 'https:') return false
+  if (!esHostInterno(analizada.hostname)) return true
+
+  // Apuntar el plugin a un sitio de prueba en la propia máquina es una forma
+  // legítima de trabajar —este sitio se midió así—, y en ese caso la red interna
+  // *es* el sitio, no un desvío. La guarda se relaja sólo entonces.
+  return baseEsInterna()
+}
+
+/**
+ * Una referencia del motor convertida en ruta.
+ *
+ * Las referencias llegan como cadenas opacas y terminan dentro de una ruta: lo
+ * que no puede llegar es un `..` que mueva la petición a otra ruta del sitio ni
+ * un `?` o un `#` que le cambien la consulta. `encodeURIComponent` solo no basta:
+ * los puntos no se codifican.
+ */
+function rutaDe(valor: string): string {
+  const tramos = valor.split('/')
+  if (/[?#\\\u0000-\u001f]/.test(valor) || tramos.some((tramo) => tramo === '.' || tramo === '..')) {
+    throw new Error(`la referencia '${valor}' no es una ruta válida`)
+  }
+
+  return tramos.map((tramo) => encodeURIComponent(tramo)).join('/')
+}
+
+/**
+ * Tope del cuerpo de una respuesta.
+ *
+ * Un sitio hostil puede contestar con gigabytes y `text()` los materializa enteros
+ * en el proceso que sirve la aplicación. Ocho megas son más que cualquier ficha,
+ * página de embed o manifiesto de este sitio, y menos que lo que hace daño. La
+ * cabecera `content-length` se mira como aviso, pero la cuenta que manda es la de
+ * los bytes que llegan: puede faltar o venir comprimida.
+ */
+const TOPE_CUERPO_BYTES = 8 * 1024 * 1024
+
+/** El texto de una respuesta, cortando si pasa del tope. */
+async function cuerpo(respuesta: Response): Promise<string> {
+  const declarado = Number(respuesta.headers.get('content-length') ?? '')
+  if (Number.isFinite(declarado) && declarado > TOPE_CUERPO_BYTES) {
+    throw new Error(`la respuesta declara ${declarado} bytes y el tope es ${TOPE_CUERPO_BYTES}`)
+  }
+
+  const lector = respuesta.body?.getReader()
+  if (lector === undefined) return ''
+
+  const trozos: Uint8Array[] = []
+  let total = 0
+
+  for (;;) {
+    const { done, value } = await lector.read()
+    if (done === true) break
+    if (value === undefined) continue
+
+    total += value.byteLength
+    if (total > TOPE_CUERPO_BYTES) {
+      // Se corta sin terminar de leer y se suelta el cuerpo, para no dejar la
+      // conexión abierta con el sitio.
+      await lector.cancel().catch(() => undefined)
+      throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} bytes y se corta`)
+    }
+
+    trozos.push(value)
+  }
+
+  const unido = new Uint8Array(total)
+  let desplazamiento = 0
+  for (const trozo of trozos) {
+    unido.set(trozo, desplazamiento)
+    desplazamiento += trozo.byteLength
+  }
+
+  return new TextDecoder().decode(unido)
 }
 
 /* --------------------------------------------------------------- texto y HTML */
@@ -176,14 +330,16 @@ async function pedir(
     if (causa instanceof Error && causa.name === 'AbortError') throw causa
 
     const motivo = causa instanceof Error ? causa.message : String(causa)
-    throw new Error(`no se pudo contactar con ${url}: ${motivo}; ${SUGERENCIA}`)
+    throw new Error(`no se pudo contactar con ${sinCredenciales(url)}: ${motivo}; ${SUGERENCIA}`)
   }
 
   // El host se mira antes que el estado: una página de retirada puede contestar
   // 404 en su destino, y lo que hay que contarle a quien lo sufre es que el
   // dominio ya no es el sitio, no el 404 de una dirección que él no pidió.
   verificarMismoHost(url, respuesta)
-  if (!respuesta.ok) throw new Error(`PelisPlusHD respondió ${respuesta.status} en ${url}`)
+  if (!respuesta.ok) {
+    throw new Error(`PelisPlusHD respondió ${respuesta.status} en ${sinCredenciales(url)}`)
+  }
 
   return respuesta
 }
@@ -596,10 +752,16 @@ async function medioDelEspejo(
   referer: string,
   opciones: CallOptions,
 ): Promise<{ fuente: Fuente; refererFinal: string } | undefined> {
+  // La dirección la eligió el sitio —el `<iframe>`, o el enlace que salió del
+  // embudo—: si apunta a la red interna, no se pide.
+  if (!destinoDeContenidoAceptable(url)) {
+    throw new Error('el espejo apunta a un destino interno o no es http(s); se descarta')
+  }
+
   const respuesta = await pedir(url, opciones, { referer }, TIMEOUT_RESOLUTOR_MS)
-  const html = await respuesta.text()
-  const cuerpo = desempaquetar(html) ?? html
-  const medio = primerMedio(cuerpo)
+  const html = await cuerpo(respuesta)
+  const desempaquetado = desempaquetar(html) ?? html
+  const medio = primerMedio(desempaquetado)
   if (medio === undefined) return undefined
 
   return {
@@ -638,7 +800,7 @@ const proveedor: Provider = {
    */
   async search(query, opciones) {
     const url = `${base()}/search?${new URLSearchParams({ s: query }).toString()}`
-    const html = await (await pedir(url, opciones)).text()
+    const html = await cuerpo(await pedir(url, opciones))
     const filas = filasDe(html)
 
     // Cero filas con el buscador delante no es «no hay nada»: es un cambio de
@@ -664,7 +826,7 @@ const proveedor: Provider = {
    * tenía al buscar, y volver a deducirlo en la ficha es donde se pierde.
    */
   async getAnime(ref, opciones): Promise<Ficha> {
-    const html = await (await pedir(`${base()}/${ref.value}`, opciones)).text()
+    const html = await cuerpo(await pedir(`${base()}/${rutaDe(ref.value)}`, opciones))
 
     const titulo =
       /<meta[^>]+property="og:title"[^>]+content="([^"]*)"/i.exec(html)?.[1] ??
@@ -712,7 +874,7 @@ const proveedor: Provider = {
       return [{ ref: { providerId: ID, value: ref.value }, animeRef: ref, number: 1, mode: 'sub' }]
     }
 
-    const html = await (await pedir(`${base()}/${ref.value}`, opciones)).text()
+    const html = await cuerpo(await pedir(`${base()}/${rutaDe(ref.value)}`, opciones))
     const capitulos = capitulosDe(html, slugDe(ref.value))
     if (capitulos.length === 0) {
       throw new Error(
@@ -742,8 +904,8 @@ const proveedor: Provider = {
    * mensaje, porque «no dio fuente» a secas no se puede arreglar desde fuera.
    */
   async resolveStream(peticion, opciones): Promise<readonly Fuente[]> {
-    const url = `${base()}/${peticion.episodeRef.value}`
-    const pagina = await (await pedir(url, opciones)).text()
+    const url = `${base()}/${rutaDe(peticion.episodeRef.value)}`
+    const pagina = await cuerpo(await pedir(url, opciones))
 
     const embed = reproductorDe(pagina)
     if (embed === undefined) {
@@ -753,7 +915,11 @@ const proveedor: Provider = {
     const embedUrl = comoUrl(embed)
     if (embedUrl === undefined) throw new Error('el reproductor del sitio no es una dirección válida')
 
-    const embedHtml = await (await pedir(embedUrl, opciones, { referer: url })).text()
+    if (!destinoDeContenidoAceptable(embedUrl)) {
+      throw new Error('el reproductor del sitio apunta a un destino interno; se descarta')
+    }
+
+    const embedHtml = await cuerpo(await pedir(embedUrl, opciones, { referer: url }))
 
     // Atajo: algunos episodios publican el host directamente, sin cerrojos.
     const directo = /playServerVast\('(https?:\/\/[^']*vidhide[^']*)'\)/i.exec(embedHtml)?.[1]
@@ -769,6 +935,15 @@ const proveedor: Provider = {
     const salt = /POW_SALT\s*=\s*'([^']+)'/i.exec(embedHtml)?.[1]
     if (challenge === undefined || salt === undefined || !Number.isInteger(difficulty)) {
       throw new Error('el embed no trae la prueba de trabajo ni un enlace directo; el sitio cambió')
+    }
+
+    // La dificultad la elige el sitio y decide cuántos ceros se exigen: sin este
+    // tope, un valor absurdo hace que `'0'.repeat` intente reservar gigabytes en
+    // el proceso que sirve la aplicación.
+    if (difficulty < 0 || difficulty > DIFICULTAD_MAXIMA) {
+      throw new Error(
+        `el embed pide una dificultad de prueba de trabajo fuera de rango (${difficulty}); se descarta`,
+      )
     }
 
     const nonce = resolverPow(challenge, difficulty)
