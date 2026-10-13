@@ -95,12 +95,19 @@ function desaplanar(datos: readonly unknown[]): unknown {
     if (Array.isArray(valor)) {
       const marca = valor[0]
       if (marca === 'Date') return new Date(String(valor[1]))
-      if (marca === 'Set') {
-        return valor.slice(1).map((elemento) => hidratar(elemento as number))
-      }
       if (marca === 'BigInt') return BigInt(String(valor[1]))
+      if (marca === 'Set') {
+        // Se memoiza **antes** de bajar, igual que las listas: un `Set` que se
+        // contenga a sí mismo, si no, no termina nunca.
+        const conjunto: unknown[] = []
+        resueltos.set(indice, conjunto)
+        for (const elemento of valor.slice(1)) conjunto.push(hidratar(elemento as number))
+
+        return conjunto
+      }
       if (marca === 'Map') {
         const mapa = new Map<unknown, unknown>()
+        resueltos.set(indice, mapa)
         for (let i = 1; i + 1 < valor.length; i += 2) {
           mapa.set(hidratar(valor[i] as number), hidratar(valor[i + 1] as number))
         }
@@ -116,7 +123,10 @@ function desaplanar(datos: readonly unknown[]): unknown {
     }
 
     if (typeof valor === 'object' && valor !== null) {
-      const objeto: Record<string, unknown> = {}
+      // Sin prototipo, a propósito: las claves las elige el JSON del sitio, y una
+      // clave `__proto__` fijaría el prototipo de este objeto y colaría valores
+      // heredados por las comprobaciones `!== undefined` de más arriba.
+      const objeto: Record<string, unknown> = Object.create(null)
       resueltos.set(indice, objeto)
       for (const [clave, referencia] of Object.entries(valor)) {
         objeto[clave] = hidratar(referencia as number)
@@ -168,7 +178,135 @@ async function pedir(
 
   if (!respuesta.ok) throw new Error(`AnimeAV1 respondió ${respuesta.status} en ${ruta}`)
 
-  return await respuesta.json()
+  const crudo = await cuerpo(respuesta)
+  try {
+    return JSON.parse(crudo) as unknown
+  } catch {
+    throw new Error(`AnimeAV1 no devolvió JSON en ${ruta}`)
+  }
+}
+
+/**
+ * Destinos que un reproductor de internet no necesita y una página hostil sí.
+ *
+ * La dirección del embed la elige el JSON del sitio, así que sin esta guarda una
+ * página comprometida puede hacer que el plugin pida `http://127.0.0.1:8080/…`,
+ * un servicio de la red de casa o la metadata de la nube, desde la máquina de
+ * quien lo copia. El proxy del motor tiene su propia comprobación de destinos,
+ * pero no cubre estas peticiones: el plugin no pasa por él.
+ *
+ * Es una comprobación **literal**, aunque `new URL` normaliza las formas raras de
+ * escribir una dirección (`127.1`, `2130706433`, `0x7f.1`) y por eso no se
+ * escapan. Un nombre que resuelva a una dirección interna sí la esquiva:
+ * resolver y fijar la dirección no está al alcance de un `fetch`, y por eso la
+ * guarda completa vive en el motor, que resuelve y mira todas las respuestas del
+ * DNS.
+ */
+const HOST_INTERNO =
+  /^(?:(?:[\w-]+\.)+(?:localhost|local|internal|home\.arpa)\.?|localhost\.?|0\.0\.0\.0|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3})$/i
+
+/**
+ * Si un anfitrión es de la red interna.
+ *
+ * Un literal IPv6 se rechaza entero: no aparece en la dirección de un
+ * reproductor, y las formas que envuelven una IPv4 —la mapeada `::ffff:7f00:1`,
+ * la de NAT64, la de 6to4— son justo las que se escapan de una lista literal.
+ */
+function esHostInterno(hostname: string): boolean {
+  return hostname.includes(':') || HOST_INTERNO.test(hostname)
+}
+
+/** Si la dirección la eligió el contenido del sitio, ¿se puede pedir? */
+function destinoDeContenidoAceptable(url: string): boolean {
+  let analizada: URL
+  try {
+    analizada = new URL(url)
+  } catch {
+    return false
+  }
+
+  if (analizada.protocol !== 'http:' && analizada.protocol !== 'https:') return false
+
+  return !esHostInterno(analizada.hostname)
+}
+
+/** Una dirección sólo se acepta si es http o https con host. */
+function comoUrl(valor: string | undefined): string | undefined {
+  if (valor === undefined) return undefined
+
+  try {
+    const url = new URL(valor)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Una referencia del motor convertida en ruta.
+ *
+ * Las referencias llegan como cadenas opacas y terminan dentro de una ruta: lo
+ * que no puede llegar es un `..` que mueva la petición a otra ruta del sitio ni
+ * un `?` o un `#` que le cambien la consulta. `encodeURIComponent` solo no basta:
+ * los puntos no se codifican.
+ */
+function rutaDe(valor: string): string {
+  const tramos = valor.split('/')
+  if (/[?#\\\u0000-\u001f]/.test(valor) || tramos.some((tramo) => tramo === '.' || tramo === '..')) {
+    throw new Error(`la referencia '${valor}' no es una ruta válida`)
+  }
+
+  return tramos.map((tramo) => encodeURIComponent(tramo)).join('/')
+}
+
+/**
+ * Tope del cuerpo de una respuesta.
+ *
+ * Un sitio hostil puede contestar con gigabytes y `text()` los materializa
+ * enteros en el proceso que sirve la aplicación. Ocho megas son más que cualquier
+ * `__data.json` o página de embed de este sitio, y menos que lo que hace daño.
+ * La cabecera `content-length` se mira como aviso, pero la cuenta que manda es la
+ * de los bytes que llegan: puede faltar o venir comprimida.
+ */
+const TOPE_CUERPO_BYTES = 8 * 1024 * 1024
+
+/** El texto de una respuesta, cortando si pasa del tope. */
+async function cuerpo(respuesta: Response): Promise<string> {
+  const declarado = Number(respuesta.headers.get('content-length') ?? '')
+  if (Number.isFinite(declarado) && declarado > TOPE_CUERPO_BYTES) {
+    throw new Error(`la respuesta declara ${declarado} bytes y el tope es ${TOPE_CUERPO_BYTES}`)
+  }
+
+  const lector = respuesta.body?.getReader()
+  if (lector === undefined) return ''
+
+  const trozos: Uint8Array[] = []
+  let total = 0
+
+  for (;;) {
+    const { done, value } = await lector.read()
+    if (done === true) break
+    if (value === undefined) continue
+
+    total += value.byteLength
+    if (total > TOPE_CUERPO_BYTES) {
+      // Se corta sin terminar de leer y se suelta el cuerpo, para no dejar la
+      // conexión abierta con el sitio.
+      await lector.cancel().catch(() => undefined)
+      throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} bytes y se corta`)
+    }
+
+    trozos.push(value)
+  }
+
+  const unido = new Uint8Array(total)
+  let desplazamiento = 0
+  for (const trozo of trozos) {
+    unido.set(trozo, desplazamiento)
+    desplazamiento += trozo.byteLength
+  }
+
+  return new TextDecoder().decode(unido)
 }
 
 /**
@@ -285,10 +423,12 @@ function anio(fecha: unknown): number | undefined {
 function portada(media: MediaCruda): string | undefined {
   const declarada = texto(media.poster) ?? texto(media.backdrop)
   if (declarada !== undefined) {
-    return declarada.startsWith('http') ? declarada : `${BASE}${declarada}`
+    return comoUrl(declarada.startsWith('http') ? declarada : `${BASE}${declarada}`)
   }
 
-  return media.id === undefined ? undefined : `${CDN}/covers/${media.id}.jpg`
+  return media.id === undefined
+    ? undefined
+    : `${CDN}/covers/${encodeURIComponent(String(media.id))}.jpg`
 }
 
 function refAnime(slug: string): Referencia {
@@ -313,7 +453,7 @@ function aResultado(fila: FilaCruda) {
   return {
     ref: refAnime(slug),
     title: titulo,
-    ...(id === undefined ? {} : { coverUrl: `${CDN}/covers/${id}.jpg` }),
+    ...(id === undefined ? {} : { coverUrl: `${CDN}/covers/${encodeURIComponent(id)}.jpg` }),
   }
 }
 
@@ -382,6 +522,10 @@ async function fuenteDeEmbed(
   url: string,
   opciones: CallOptions,
 ): Promise<FuenteEncontrada | undefined> {
+  // La dirección del embed la eligió el sitio: si apunta a la red interna, no se
+  // pide y se pasa al siguiente.
+  if (!destinoDeContenidoAceptable(url)) return undefined
+
   let html: string
   try {
     const respuesta = await fetch(url, {
@@ -396,7 +540,7 @@ async function fuenteDeEmbed(
     })
 
     if (!respuesta.ok) return undefined
-    html = await respuesta.text()
+    html = await cuerpo(respuesta)
   } catch {
     return undefined
   }
@@ -411,17 +555,16 @@ async function fuenteDeEmbed(
   // video.
   let archivo: FuenteEncontrada | undefined
   for (const candidata of plano.match(/https?:\/\/[^\s"'<>\\]+/g) ?? []) {
-    let ruta: string
-    try {
-      ruta = new URL(candidata).pathname.toLowerCase()
-    } catch {
-      continue
-    }
+    // La dirección se normaliza antes de devolverla: el motor la valida igual,
+    // pero un plugin no debe entregar una cadena que no ha mirado.
+    const limpia = comoUrl(candidata)
+    if (limpia === undefined) continue
 
+    const ruta = new URL(limpia).pathname.toLowerCase()
     const cabeceras = { Referer: `${origenDe(url)}/` }
-    if (ruta.endsWith('.m3u8')) return { url: candidata, kind: 'hls', headers: cabeceras }
+    if (ruta.endsWith('.m3u8')) return { url: limpia, kind: 'hls', headers: cabeceras }
     if (archivo === undefined && /\.(mp4|mkv|webm)$/.test(ruta)) {
-      archivo = { url: candidata, kind: 'file', headers: cabeceras }
+      archivo = { url: limpia, kind: 'file', headers: cabeceras }
     }
   }
 
@@ -475,7 +618,7 @@ const proveedor: Provider = {
   },
 
   async getAnime(ref, opciones) {
-    const datos = await datosDe(`/media/${encodeURIComponent(slugDe(ref))}`, opciones)
+    const datos = await datosDe(`/media/${rutaDe(slugDe(ref))}`, opciones)
     const media = datos.media as MediaCruda | undefined
     if (media === undefined) throw new Error(`AnimeAV1 no tiene el título ${ref.value}`)
 
@@ -519,7 +662,7 @@ const proveedor: Provider = {
    * reproducir, que es donde el dato existe.
    */
   async getEpisodes(ref, opciones) {
-    const datos = await datosDe(`/media/${encodeURIComponent(slugDe(ref))}`, opciones)
+    const datos = await datosDe(`/media/${rutaDe(slugDe(ref))}`, opciones)
     const media = datos.media as MediaCruda | undefined
     if (media === undefined) throw new Error(`AnimeAV1 no tiene el título ${ref.value}`)
 
@@ -553,7 +696,7 @@ const proveedor: Provider = {
     }
 
     const datos = (await datosDe(
-      `/media/${encodeURIComponent(partes.slug)}/${partes.numero}`,
+      `/media/${rutaDe(partes.slug)}/${partes.numero}`,
       opciones,
     )) as DatosEpisodio
 
