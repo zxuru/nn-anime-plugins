@@ -1,0 +1,10 @@
+# Los plugins se hashean en `SHA256SUMS` y `core.autocrlf` los escribiría con
+# CRLF en Windows: el hash dejaría de cuadrar sin que nadie hubiera tocado el
+# archivo. Todo lo que se hashea o se ejecuta va en LF, en cualquier máquina.
+*.ts text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+.gitattributes text eol=lf
+SHA256SUMS text eol=lf
