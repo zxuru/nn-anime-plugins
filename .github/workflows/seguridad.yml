@@ -1,0 +1,61 @@
+name: seguridad
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Lo que se puede comprobar sin el repositorio del motor.
+  pruebas:
+    name: hashes y pruebas de seguridad
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # El hash va primero: si un plugin no es el que se revisó, lo demás da igual.
+      # El cálculo normaliza el fin de línea, así que no depende de `autocrlf`.
+      - name: Verificar los hashes de los plugins
+        run: sh scripts/hashes.sh --verificar providers
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Pruebas de seguridad
+        run: bun test tests/security
+
+  # El typecheck y la conformidad necesitan el SDK, que vive en el repositorio del
+  # motor y es privado. El trabajo se activa definiendo la variable de repositorio
+  # `SDK_REPO` (por ejemplo `zxuru/nn-anime`) y el secreto `SDK_TOKEN` con permiso
+  # de lectura sobre él; sin ellos se salta en vez de fallar, porque un CI en rojo
+  # permanente no lo mira nadie.
+  contrato:
+    name: tipos y conformidad contra el SDK
+    if: vars.SDK_REPO != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: nn-anime-plugins
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SDK_REPO }}
+          token: ${{ secrets.SDK_TOKEN }}
+          path: nn-anime
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Los dos repositorios quedan uno al lado del otro: es lo que espera el
+      # `paths` de tsconfig.json (`../nn-anime/packages/provider-sdk/src`).
+      - name: Tipos
+        working-directory: nn-anime-plugins
+        run: bunx tsc -p tsconfig.json
+
+      # Con el SDK presente, la conformidad ya no se salta.
+      - name: Conformidad
+        working-directory: nn-anime-plugins
+        run: bun test tests/security/conformidad.test.ts

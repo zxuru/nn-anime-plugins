@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "typeRoots": ["./node_modules/@types", "../nn-anime/node_modules/@types"],
+    "types": ["bun"],
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@nn-anime/provider-sdk": ["../nn-anime/packages/provider-sdk/src/index.ts"],
+      "@nn-anime/core": ["../nn-anime/packages/core/src/index.ts"]
+    }
+  },
+  "include": ["providers/**/*.ts", "tests/**/*.ts"]
+}
