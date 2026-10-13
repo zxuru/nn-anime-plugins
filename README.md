@@ -15,10 +15,41 @@ reales van aquí, separados a propósito.
 |---|---|---|---|---|---|---|---|
 | `jkanime` | [jkanime.net](https://jkanime.net) | sí | sí | no | sí | sí | sí |
 | `animeav1` | [animeav1.com](https://animeav1.com) | sí | sí | sí | sí | no | no |
+| `pelisplushd` | [pelisplushd.bz](https://pelisplushd.bz) | sí | sí | sí | no | no | no |
+| `animex` | [animex.one](https://animex.one) | sí | sí | sí | no | no | no |
 
-Los dos son adaptadores de lectura: piden las páginas del sitio, extraen lo que el contrato pide y
+Los cuatro son adaptadores de lectura: piden las páginas del sitio, extraen lo que el contrato pide y
 devuelven datos. Ninguno descarga, aloja ni redistribuye contenido, y ninguno guarda credenciales
 —no hay ninguna que guardar.
+
+`pelisplushd` es el único que sirve **películas y series**: devuelve `kind: 'movie'` o `'tv'`, una
+película es un episodio con número 1 y una serie lista sus capítulos con la temporada y el capítulo en
+el título. Su resolutor no ejecuta nada del sitio: interpreta el empaquetador
+`eval(function(p,a,c,k,e,d){…})`, resuelve la prueba de trabajo con `node:crypto` y descifra el enlace
+con AES-256-CBC, que es lo que hace `ani-cli-mx`. La dirección base se puede repuntar con
+`NN_ANIME_PELISPLUS_URL`, porque estos dominios cambian de sufijo.
+
+**El dominio, hoy, no existe.** Medido el 12 de octubre de 2026 desde esta máquina: pelisplushd.mx,
+.bz y .to resuelven todos a 20.127.234.48 y no contestan por 443; .nu y .com están aparcados
+(ParkLogic y HugeDomains), y .net redirige a alliance4creativity.com/watch-it-legally, que es la
+página que dejan las retiradas de dominio. Por eso no carga en el navegador. El plugin sigue siendo
+correcto —lo que le falta es una casa—: se le apunta cualquier dominio vivo de la misma familia con
+NN_ANIME_PELISPLUS_URL, y cuando el dominio no contesta o redirige a otra parte lo dice con esas
+palabras en vez de devolver una lista vacía.
+
+**Pendiente de comprobar en vivo.** El plugin se ha medido de punta a punta contra un sitio falso
+local —buscador, ficha, capítulos, embed con prueba de trabajo, espejo empaquetado—, pero **no**
+contra un sitio vivo de esta familia: los selectores del buscador y de la lista de capítulos son los de `ani-cli-mx`
+leídos de su código, y el sitio puede haber cambiado el marcado. Si devuelve cero fichas, lo dice con
+ese mensaje en vez de fingir que no hay resultados.
+
+`animex` es el único con **API de verdad**: el catálogo va por GraphQL (`graphql.animex.one`) y los
+episodios, los servidores y los enlaces por REST (`pp.animex.one`), así que no hay HTML que parsear
+en ninguna parte. Dos cosas que se midieron y están en el código: el host del manifiesto **ata el
+token al `User-Agent` con el que se pidió** —la misma URL da 200 con el agente que la pidió y 403 con
+cualquier otro, o sin ninguno—, así que la fuente declara el mismo agente que usa el plugin para
+hablar con la API; y las pistas de subtítulos del JSON **no se devuelven**, porque su host contesta
+403 «Website Access Blocked» desde Cloudflare a cualquier petición que salga de aquí.
 
 ## Instalar
 
