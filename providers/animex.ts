@@ -132,7 +132,57 @@ async function pedir(
 
   if (!respuesta.ok) throw new Error(`AnimeX respondió ${respuesta.status} en ${url}`)
 
-  return await respuesta.text()
+  return await cuerpo(respuesta)
+}
+
+/**
+ * Tope del cuerpo de una respuesta.
+ *
+ * Un sitio hostil puede contestar con gigabytes y `text()` los materializa
+ * enteros en el proceso que sirve la aplicación. Ocho megas son más que cualquier
+ * respuesta de esta API, y menos que lo que hace daño. La cabecera
+ * `content-length` se mira como aviso, pero la cuenta que manda es la de los
+ * bytes que llegan: puede faltar o venir comprimida.
+ */
+const TOPE_CUERPO_BYTES = 8 * 1024 * 1024
+
+/** El texto de una respuesta, cortando si pasa del tope. */
+async function cuerpo(respuesta: Response): Promise<string> {
+  const declarado = Number(respuesta.headers.get('content-length') ?? '')
+  if (Number.isFinite(declarado) && declarado > TOPE_CUERPO_BYTES) {
+    throw new Error(`la respuesta declara ${declarado} bytes y el tope es ${TOPE_CUERPO_BYTES}`)
+  }
+
+  const lector = respuesta.body?.getReader()
+  if (lector === undefined) return ''
+
+  const trozos: Uint8Array[] = []
+  let total = 0
+
+  for (;;) {
+    const { done, value } = await lector.read()
+    if (done === true) break
+    if (value === undefined) continue
+
+    total += value.byteLength
+    if (total > TOPE_CUERPO_BYTES) {
+      // Se corta sin terminar de leer y se suelta el cuerpo, para no dejar la
+      // conexión abierta con el sitio.
+      await lector.cancel().catch(() => undefined)
+      throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} bytes y se corta`)
+    }
+
+    trozos.push(value)
+  }
+
+  const unido = new Uint8Array(total)
+  let desplazamiento = 0
+  for (const trozo of trozos) {
+    unido.set(trozo, desplazamiento)
+    desplazamiento += trozo.byteLength
+  }
+
+  return new TextDecoder().decode(unido)
 }
 
 /** Una consulta al catálogo. Un error de GraphQL se cuenta con su mensaje. */
@@ -391,6 +441,24 @@ function claseDe(fuente: FuenteCruda): 'hls' | 'file' {
   return 'file'
 }
 
+/**
+ * Los nombres de cabecera que la API puede dictar para pedir el medio.
+ *
+ * Son las que el host del manifiesto mira —el `Referer` y el agente— y ninguna
+ * más. Sin esta lista, un `Host`, un `Cookie` o un `Authorization` los elegiría
+ * el tercero que contesta a la API, no este plugin, y ninguno de los tres hace
+ * falta para reproducir. Añadir uno nuevo es una línea.
+ */
+const CABECERAS_QUE_SE_REENVIAN: ReadonlySet<string> = new Set([
+  'referer',
+  'referrer',
+  'origin',
+  'user-agent',
+  'accept',
+  'accept-language',
+  'range',
+])
+
 /** Las cabeceras que la API exige para esa fuente, si exige alguna. */
 function cabecerasDe(crudo: unknown): Readonly<Record<string, string>> {
   const objetoCabeceras = objeto(crudo)
@@ -398,6 +466,8 @@ function cabecerasDe(crudo: unknown): Readonly<Record<string, string>> {
 
   const salida: Record<string, string> = {}
   for (const [clave, valor] of Object.entries(objetoCabeceras)) {
+    if (!CABECERAS_QUE_SE_REENVIAN.has(clave.toLowerCase())) continue
+
     const limpio = texto(valor)
     if (limpio !== undefined) salida[clave] = limpio
   }
