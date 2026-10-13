@@ -193,6 +193,137 @@ function slugDe(url: string | undefined): string | undefined {
   return encontrado
 }
 
+// ---------------------------------------------------------------------------
+// Guardas de red, de credenciales y de tamaño
+// ---------------------------------------------------------------------------
+
+/**
+ * Credenciales que viajan dentro de una dirección.
+ *
+ * El motor que carga este plugin redacta **por nombre de clave**, así que una
+ * credencial metida dentro de una cadena no la ve nadie más que quien la
+ * escribe: la firma de un `.m3u8` o el testigo de un espejo acabarían en el
+ * mensaje de un fallo y de ahí a una captura de pantalla. Se quitan aquí, que es
+ * el único sitio que construye ese texto.
+ */
+const CREDENCIAL_EN_URL = /([?&](?:api_key|apikey|key|token|expires|asn|signature|sig|hash|auth)=)[^&#\s]*/gi
+
+function sinCredenciales(url: string): string {
+  return url.replace(CREDENCIAL_EN_URL, '$1[redactado]')
+}
+
+/**
+ * Destinos que un reproductor de internet no necesita y una página hostil sí.
+ *
+ * La dirección de la siguiente petición la elige el contenido del sitio —el
+ * `<iframe>` del reproductor—, así que sin esta guarda una página comprometida
+ * puede hacer que el plugin pida `http://127.0.0.1:8080/…`, un servicio de la
+ * red de casa o la metadata de la nube, desde la máquina de quien lo copia. El
+ * proxy del motor tiene su propia comprobación de destinos, pero no cubre estas
+ * peticiones: el plugin no pasa por él.
+ *
+ * Es una comprobación **literal**, aunque `new URL` normaliza las formas raras
+ * de escribir una dirección (`127.1`, `2130706433`, `0x7f.1`) y por eso no se
+ * escapan. Un nombre que resuelva a una dirección interna sí la esquiva:
+ * resolver y fijar la dirección no está al alcance de un `fetch`, y por eso la
+ * guarda completa vive en el motor, que resuelve y mira todas las respuestas del
+ * DNS.
+ */
+const HOST_INTERNO =
+  /^(?:(?:[\w-]+\.)+(?:localhost|local|internal|home\.arpa)\.?|localhost\.?|0\.0\.0\.0|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3})$/i
+
+/**
+ * Si un anfitrión es de la red interna.
+ *
+ * Un literal IPv6 se rechaza entero: no aparece en la dirección de un
+ * reproductor, y las formas que envuelven una IPv4 —la mapeada `::ffff:7f00:1`,
+ * la de NAT64, la de 6to4— son justo las que se escapan de una lista literal.
+ */
+function esHostInterno(hostname: string): boolean {
+  return hostname.includes(':') || HOST_INTERNO.test(hostname)
+}
+
+/** Si la dirección la eligió el contenido del sitio, ¿se puede pedir? */
+function destinoDeContenidoAceptable(url: string): boolean {
+  let analizada: URL
+  try {
+    analizada = new URL(url)
+  } catch {
+    return false
+  }
+
+  if (analizada.protocol !== 'http:' && analizada.protocol !== 'https:') return false
+
+  return !esHostInterno(analizada.hostname)
+}
+
+/**
+ * Una referencia del motor convertida en ruta.
+ *
+ * Las referencias llegan como cadenas opacas, y lo que no puede llegar es un
+ * `..` que mueva la petición a otra ruta del sitio ni un `?` o un `#` que le
+ * cambien la consulta: la petición del paginador viaja con la cookie de sesión y
+ * el token CSRF. Cada tramo se codifica y los tramos `.` y `..` se rechazan.
+ */
+function rutaDe(valor: string): string {
+  const tramos = valor.split('/')
+  if (/[?#\\\u0000-\u001f]/.test(valor) || tramos.some((tramo) => tramo === '.' || tramo === '..')) {
+    throw new Error(`la referencia '${valor}' no es una ruta válida`)
+  }
+
+  return tramos.map((tramo) => encodeURIComponent(tramo)).join('/')
+}
+
+/**
+ * Tope del cuerpo de una respuesta.
+ *
+ * Un sitio hostil puede contestar con gigabytes y `text()` los materializa
+ * enteros en el proceso que sirve la aplicación. Ocho megas son más que
+ * cualquier ficha o listado de este sitio, y menos que lo que hace daño. La
+ * cabecera `content-length` se mira como aviso, pero la cuenta que manda es la
+ * de los bytes que llegan: puede faltar o venir comprimida.
+ */
+const TOPE_CUERPO_BYTES = 8 * 1024 * 1024
+
+/** El texto de una respuesta, cortando si pasa del tope. */
+async function cuerpo(respuesta: Response): Promise<string> {
+  const declarado = Number(respuesta.headers.get('content-length') ?? '')
+  if (Number.isFinite(declarado) && declarado > TOPE_CUERPO_BYTES) {
+    throw new Error(`la respuesta declara ${declarado} bytes y el tope es ${TOPE_CUERPO_BYTES}`)
+  }
+
+  const lector = respuesta.body?.getReader()
+  if (lector === undefined) return ''
+
+  const trozos: Uint8Array[] = []
+  let total = 0
+
+  for (;;) {
+    const { done, value } = await lector.read()
+    if (done === true) break
+    if (value === undefined) continue
+
+    total += value.byteLength
+    if (total > TOPE_CUERPO_BYTES) {
+      // Se corta sin terminar de leer y se suelta el cuerpo, para no dejar la
+      // conexión abierta con el sitio.
+      await lector.cancel().catch(() => undefined)
+      throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} bytes y se corta`)
+    }
+
+    trozos.push(value)
+  }
+
+  const unido = new Uint8Array(total)
+  let desplazamiento = 0
+  for (const trozo of trozos) {
+    unido.set(trozo, desplazamiento)
+    desplazamiento += trozo.byteLength
+  }
+
+  return new TextDecoder().decode(unido)
+}
+
 interface Peticion {
   readonly metodo?: string
   readonly cuerpo?: string
@@ -257,11 +388,13 @@ async function pedir(
     reanudarEn = Date.now() + PAUSA_429_MS
 
     throw new Error(
-      `jkanime respondió 429 en ${url}; no se le pedirá nada en ${PAUSA_429_MS / 1000} s`,
+      `jkanime respondió 429 en ${sinCredenciales(url)}; no se le pedirá nada en ${PAUSA_429_MS / 1000} s`,
     )
   }
 
-  if (!respuesta.ok) throw new Error(`jkanime respondió ${respuesta.status} en ${url}`)
+  if (!respuesta.ok) {
+    throw new Error(`jkanime respondió ${respuesta.status} en ${sinCredenciales(url)}`)
+  }
 
   return respuesta
 }
@@ -412,10 +545,15 @@ async function listadoDeEpisodios(
     metodo: 'POST',
     cuerpo: new URLSearchParams({ _token: sesion.token }).toString(),
     galletas: sesion.galletas,
-    referer: `${BASE}/${anime}/`,
+    referer: `${BASE}/${rutaDe(anime)}/`,
   })
 
-  return respuesta.json()
+  const crudo = await cuerpo(respuesta)
+  try {
+    return JSON.parse(crudo) as unknown
+  } catch {
+    throw new Error(`jkanime no devolvió JSON en ${sinCredenciales(url)}`)
+  }
 }
 
 function episodiosDe(crudo: unknown, anime: string): readonly Episodio[] {
@@ -493,7 +631,12 @@ async function fuenteDeJugador(
   referer: string,
   options: CallOptions,
 ): Promise<Fuente | undefined> {
-  const html = await (await pedir(url, options, { referer })).text()
+  // El `<iframe>` lo eligió el sitio: si apunta a la red interna, no se pide.
+  if (!destinoDeContenidoAceptable(url)) {
+    throw new Error('el reproductor apunta a un destino interno o no es http(s); se descarta')
+  }
+
+  const html = await cuerpo(await pedir(url, options, { referer }))
 
   const hls = /https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*/.exec(html)?.[0]
   if (hls !== undefined) {
@@ -633,8 +776,8 @@ async function fichaYSesion(
   anime: string,
   options: CallOptions,
 ): Promise<{ readonly sesion: Sesion; readonly html: string }> {
-  const ficha = await pedir(`${BASE}/${anime}/`, options)
-  const html = await ficha.text()
+  const ficha = await pedir(`${BASE}/${rutaDe(anime)}/`, options)
+  const html = await cuerpo(ficha)
 
   return { sesion: sesionDe(html, galletasDe(ficha)), html }
 }
@@ -669,20 +812,22 @@ const jkanime: Provider = {
   },
 
   async search(query, options) {
-    const html = await (await pedir(`${BASE}/buscar/${encodeURIComponent(query)}/`, options)).text()
+    const html = await cuerpo(
+      await pedir(`${BASE}/buscar/${encodeURIComponent(query)}/`, options),
+    )
 
     return tarjetas(html)
   },
 
   async getAnime(ref, options) {
-    const html = await (await pedir(`${BASE}/${ref.value}/`, options)).text()
+    const html = await cuerpo(await pedir(`${BASE}/${rutaDe(ref.value)}/`, options))
 
     return detalle(ref, html)
   },
 
   async getEpisodes(ref, options) {
-    const ficha = await pedir(`${BASE}/${ref.value}/`, options)
-    const sesion = sesionDe(await ficha.text(), galletasDe(ficha))
+    const ficha = await pedir(`${BASE}/${rutaDe(ref.value)}/`, options)
+    const sesion = sesionDe(await cuerpo(ficha), galletasDe(ficha))
     const primera = await listadoDeEpisodios(sesion, ref.value, 1, options)
     const ultima = Math.max(1, numeroDe(primera, 'last_page') ?? 1)
     const tope = Math.min(ultima, Math.ceil(TOPE_EPISODIOS / EPISODIOS_POR_PAGINA))
@@ -718,6 +863,12 @@ const jkanime: Provider = {
    * sin ser la última.
    */
   async getEpisodesPage(ref, page, options) {
+    // La página la elige quien llama y termina en la ruta del paginador: o es un
+    // entero positivo, o no se pide nada.
+    if (!Number.isInteger(page) || page < 1) {
+      throw new Error(`la página ${page} no es un número de página`)
+    }
+
     const { sesion, html } = await fichaYSesion(ref.value, options)
     const crudo = await listadoDeEpisodios(sesion, ref.value, page, options)
     const ultima = Math.max(1, numeroDe(crudo, 'last_page') ?? 1)
@@ -773,7 +924,9 @@ const jkanime: Provider = {
     const ultima = Math.max(1, numeroDe(primera, 'last_page') ?? 1)
     const crudo =
       ultima === 1 ? primera : await listadoDeEpisodios(sesion, ref.value, ultima, options)
-    const ultimo = episodiosDe(crudo, ref.value)
+    // La lista se copia antes de ordenar: lo que devuelve el lector es de sólo
+    // lectura.
+    const ultimo = [...episodiosDe(crudo, ref.value)]
       .sort((a, b) => a.number - b.number)
       .at(-1)
 
@@ -783,8 +936,8 @@ const jkanime: Provider = {
   },
 
   async resolveStream(request: PeticionStream, options) {
-    const url = `${BASE}/${request.episodeRef.value}/`
-    const html = await (await pedir(url, options)).text()
+    const url = `${BASE}/${rutaDe(request.episodeRef.value)}/`
+    const html = await cuerpo(await pedir(url, options))
     const fuentes: Fuente[] = []
     const vistos = new Set<string>()
     /**
@@ -835,13 +988,13 @@ const jkanime: Provider = {
   },
 
   async getTrending(options) {
-    const html = await (await pedir(`${BASE}/top`, options)).text()
+    const html = await cuerpo(await pedir(`${BASE}/top`, options))
 
     return tendencias(html)
   },
 
   async getFeed(options) {
-    const html = await (await pedir(BASE, options)).text()
+    const html = await cuerpo(await pedir(BASE, options))
 
     return novedades(html, new Date())
   },
