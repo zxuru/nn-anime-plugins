@@ -25,7 +25,7 @@
  */
 
 import { createDecipheriv } from 'node:crypto'
-import type { CallOptions, Provider, ProviderResponse } from '@nn-anime/provider-sdk'
+import type { CallOptions, PluginFetch, PluginResponse, Provider, ProviderResponse } from '@nn-anime/provider-sdk'
 
 /*
  * Los tipos del dominio, nombrados aquí y no importados de `@nn-anime/core`: el
@@ -45,15 +45,6 @@ const VARIABLE_DE_ENTORNO = 'NN_ANIME_GNULA_URL'
 
 const AGENTE =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0'
-
-const TIMEOUT_POR_DEFECTO_MS = 8000
-
-/**
- * El plazo del resolutor, más largo que el de una búsqueda: resolver un enlace
- * son la ficha y el reproductor, y el `timeoutMs` del contrato es una sugerencia,
- * no una carrera que haya que ganar.
- */
-const TIMEOUT_RESOLUTOR_MS = 20_000
 
 /**
  * Los anfitriones que no son reproductores sino **selectores**, y que hay que
@@ -211,63 +202,56 @@ function rutaDe(valor: string): string {
 }
 
 /**
- * Tope del cuerpo de una respuesta.
+ * Tope del cuerpo que el plugin **pide** a la capacidad, en bytes.
  *
- * Un sitio hostil puede contestar con gigabytes y `text()` los materializa enteros
- * en el proceso que sirve la aplicación. Ocho megas son más que cualquier ficha,
- * reproductor o lista de un selector de este sitio, y menos que lo que hace daño.
- * La cabecera `content-length` se mira como aviso, pero la cuenta que manda es la
- * de los bytes que llegan: puede faltar o venir comprimida.
+ * El motor aplica el suyo por debajo y corta mientras llega; este es el que
+ * declara el plugin para que el corte sea el de siempre. Un sitio hostil puede
+ * contestar con gigabytes, y materializarlos en el proceso que sirve la
+ * aplicación es justo lo que este número evita.
  */
 const TOPE_CUERPO_BYTES = 8 * 1024 * 1024
 
-/** El texto de una respuesta, cortando si pasa del tope. */
-async function cuerpo(respuesta: Response): Promise<string> {
-  const declarado = Number(respuesta.headers.get('content-length') ?? '')
-  if (Number.isFinite(declarado) && declarado > TOPE_CUERPO_BYTES) {
-    throw new Error(`la respuesta declara ${declarado} bytes y el tope es ${TOPE_CUERPO_BYTES}`)
+/**
+ * El texto de una respuesta, ya descomprimido y ya acotado por el motor.
+ *
+ * El tope lo aplica la capacidad —`maxBytes` en cada petición— y llega contado
+ * en bytes, así que esta cuenta de caracteres es la **segunda** defensa y no la
+ * única: si el motor dejara de cortar, el plugin sigue cortando por su cuenta.
+ */
+async function cuerpo(respuesta: PluginResponse): Promise<string> {
+  if (respuesta.body.length > TOPE_CUERPO_BYTES) {
+    throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} caracteres y se corta`)
   }
 
-  const lector = respuesta.body?.getReader()
-  if (lector === undefined) return ''
-
-  const trozos: Uint8Array[] = []
-  let total = 0
-
-  for (;;) {
-    const { done, value } = await lector.read()
-    if (done === true) break
-    if (value === undefined) continue
-
-    total += value.byteLength
-    if (total > TOPE_CUERPO_BYTES) {
-      // Se corta sin terminar de leer y se suelta el cuerpo, para no dejar la
-      // conexión abierta con el sitio.
-      await lector.cancel().catch(() => undefined)
-      throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} bytes y se corta`)
-    }
-
-    trozos.push(value)
-  }
-
-  const unido = new Uint8Array(total)
-  let desplazamiento = 0
-  for (const trozo of trozos) {
-    unido.set(trozo, desplazamiento)
-    desplazamiento += trozo.byteLength
-  }
-
-  return new TextDecoder().decode(unido)
+  return respuesta.body
 }
 
 /* --------------------------------------------------------------- texto y HTML */
 
-/** Une la cancelación del motor con el plazo de esta petición. */
-function senalDe(opciones: CallOptions, ms: number): AbortSignal {
-  const plazo = AbortSignal.timeout(ms > 0 ? ms : TIMEOUT_POR_DEFECTO_MS)
-  const unir = (AbortSignal as unknown as { any?: (senales: AbortSignal[]) => AbortSignal }).any
+/**
+ * La puerta a la red de esta llamada.
+ *
+ * Sale de `CallOptions.fetch`, la capacidad que el motor pone **siempre**: es la
+ * que aplica la lista blanca de destinos, resuelve el nombre una vez, fija la
+ * dirección a la que se conecta y acota el cuerpo. Antes esto era el `fetch`
+ * global y el plazo lo ponía el plugin; ahora lo pone el motor, por petición.
+ *
+ * Falla cerrado si no está —un motor viejo, o una prueba que no la ponga— en vez
+ * de caer al `fetch` global, que se saltaría la política de destinos: que un
+ * plugin la use tiene que ser una decisión visible, no un descuido.
+ */
+function redDe(opciones: CallOptions): PluginFetch {
+  const red = opciones.fetch
+  if (red === undefined) {
+    throw new Error('este motor no ofrece la capacidad de red; actualiza nn-anime')
+  }
 
-  return typeof unir === 'function' ? unir([opciones.signal, plazo]) : plazo
+  return red
+}
+
+/** Un estado 2xx, que es lo que el `Response` de la API web llamaba `ok`. */
+function esEstadoOk(respuesta: PluginResponse): boolean {
+  return respuesta.status >= 200 && respuesta.status < 300
 }
 
 /** Lo que se le dice a quien se encuentre un dominio caído, que aquí es lo normal. */
@@ -286,32 +270,30 @@ async function pedir(
   opciones: CallOptions,
   extra: {
     readonly referer?: string
-    readonly ms?: number
     readonly acepta?: string
     /** Un estado que no sea 2xx no siempre es un fallo: una API puede explicarlo en su cuerpo. */
     readonly tolerarEstado?: boolean
   } = {},
-): Promise<Response> {
-  let respuesta: Response
+): Promise<PluginResponse> {
+  let respuesta: PluginResponse
   try {
-    respuesta = await fetch(url, {
-      redirect: 'follow',
+    respuesta = await redDe(opciones)(url, {
       headers: {
         accept: extra.acepta ?? 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
         'accept-language': 'es-MX,es;q=0.9',
         'user-agent': AGENTE,
         ...(extra.referer === undefined ? {} : { referer: extra.referer }),
       },
-      signal: senalDe(opciones, extra.ms ?? TIMEOUT_POR_DEFECTO_MS),
+      maxBytes: TOPE_CUERPO_BYTES,
     })
   } catch (causa) {
-    if (causa instanceof Error && causa.name === 'AbortError') throw causa
+    if (opciones.signal.aborted) throw causa
 
     const motivo = causa instanceof Error ? causa.message : String(causa)
     throw new Error(`no se pudo contactar con ${sinCredenciales(url)}: ${motivo}; ${SUGERENCIA}`)
   }
 
-  if (!respuesta.ok && extra.tolerarEstado !== true) {
+  if (!esEstadoOk(respuesta) && extra.tolerarEstado !== true) {
     throw new Error(
       `${new URL(url).host} respondió ${respuesta.status} en ${sinCredenciales(url)}`,
     )
@@ -600,7 +582,7 @@ function primerMedio(texto: string): { url: string; kind: 'hls' | 'file' } | und
  * exige ninguna cabecera, así que la fuente viaja limpia.
  */
 async function resolverUqload(url: string, opciones: CallOptions): Promise<Fuente | undefined> {
-  const html = await cuerpo(await pedir(url, opciones, { ms: TIMEOUT_RESOLUTOR_MS }))
+  const html = await cuerpo(await pedir(url, opciones))
 
   const desempaquetado = desempaquetar(html) ?? html
   const declarado = /sources\s*:\s*\[\s*\{\s*file\s*:\s*"([^"]+)"/i.exec(desempaquetado)?.[1]
@@ -696,7 +678,7 @@ async function resolverVoe(url: string, opciones: CallOptions): Promise<Fuente |
   // Un salto al espejo y, como mucho, un segundo por si el espejo vuelve a
   // moverse: el bucle existe por el salto, no para reintentar un sitio caído.
   for (let paso = 0; paso < 3; paso += 1) {
-    const html = await cuerpo(await pedir(pagina, opciones, { ms: TIMEOUT_RESOLUTOR_MS }))
+    const html = await cuerpo(await pedir(pagina, opciones))
 
     const bruto = /<script type="application\/json">([\s\S]*?)<\/script>/.exec(html)?.[1]
     if (bruto !== undefined) {
@@ -827,7 +809,7 @@ async function resolverFilemoon(url: string, opciones: CallOptions): Promise<Fue
   const respuesta = await pedir(
     `${enlace.protocol}//${enlace.hostname}/api/videos/${codigo}`,
     opciones,
-    { referer: url, acepta: 'application/json', ms: TIMEOUT_RESOLUTOR_MS, tolerarEstado: true },
+    { referer: url, acepta: 'application/json', tolerarEstado: true },
   )
   let datos: { playback?: CajaFilemoon }
   try {
@@ -872,7 +854,7 @@ async function resolverFilemoon(url: string, opciones: CallOptions): Promise<Fue
  * leen: no son streams.
  */
 async function servidoresDeSelector(url: string, opciones: CallOptions): Promise<readonly string[]> {
-  const html = await cuerpo(await pedir(url, opciones, { ms: TIMEOUT_RESOLUTOR_MS }))
+  const html = await cuerpo(await pedir(url, opciones))
 
   return [
     ...new Set(
@@ -1175,7 +1157,7 @@ const proveedor: Provider = {
     if (slug === '') throw new Error(`la referencia '${peticion.episodeRef.value}' no nombra ninguna película`)
 
     const html = await cuerpo(
-      await pedir(`${base()}/movie/${rutaDe(slug)}/`, opciones, { ms: TIMEOUT_RESOLUTOR_MS }),
+      await pedir(`${base()}/movie/${rutaDe(slug)}/`, opciones),
     )
 
     const opcionesDeIdioma = opcionesDe(html)

@@ -27,7 +27,13 @@
  * SECURITY.md antes de confiar en uno.
  */
 
-import type { CallOptions, Provider } from '@nn-anime/provider-sdk'
+import type {
+  CallOptions,
+  PluginFetch,
+  PluginRequest,
+  PluginResponse,
+  Provider,
+} from '@nn-anime/provider-sdk'
 
 /**
  * La referencia, escrita aquí y no importada del SDK.
@@ -151,21 +157,39 @@ interface DocumentoDatos {
   } | null)[]
 }
 
-/** Une la cancelación del motor con el plazo de la llamada. */
-function senalDe(opciones: CallOptions): AbortSignal {
-  const plazo = AbortSignal.timeout(opciones.timeoutMs > 0 ? opciones.timeoutMs : 10_000)
-  const unir = (AbortSignal as unknown as { any?: (senales: AbortSignal[]) => AbortSignal }).any
+/**
+ * La puerta a la red de esta llamada.
+ *
+ * Sale de `CallOptions.fetch`, la capacidad que el motor pone **siempre**: es la
+ * que aplica la lista blanca de destinos, resuelve el nombre una vez, fija la
+ * dirección a la que se conecta y acota el cuerpo. Antes esto era el `fetch`
+ * global y el plazo lo ponía el plugin; ahora lo pone el motor, por petición.
+ *
+ * Falla cerrado si no está —un motor viejo, o una prueba que no la ponga— en vez
+ * de caer al `fetch` global, que se saltaría la política de destinos: que un
+ * plugin la use tiene que ser una decisión visible, no un descuido.
+ */
+function redDe(opciones: CallOptions): PluginFetch {
+  const red = opciones.fetch
+  if (red === undefined) {
+    throw new Error('este motor no ofrece la capacidad de red; actualiza nn-anime')
+  }
 
-  return typeof unir === 'function' ? unir([opciones.signal, plazo]) : plazo
+  return red
+}
+
+/** Un estado 2xx, que es lo que el `Response` de la API web llamaba `ok`. */
+function esEstadoOk(respuesta: PluginResponse): boolean {
+  return respuesta.status >= 200 && respuesta.status < 300
 }
 
 /** Una petición al sitio que falla con el estado y la ruta, no con un `fetch` roto. */
 async function pedir(
   ruta: string,
   opciones: CallOptions,
-  init: RequestInit = {},
+  init: PluginRequest = {},
 ): Promise<unknown> {
-  const respuesta = await fetch(`${BASE}${ruta}`, {
+  const respuesta = await redDe(opciones)(`${BASE}${ruta}`, {
     ...init,
     headers: {
       accept: 'application/json, text/html;q=0.8',
@@ -173,10 +197,10 @@ async function pedir(
       'user-agent': AGENTE,
       ...(init.headers ?? {}),
     },
-    signal: senalDe(opciones),
+    maxBytes: TOPE_CUERPO_BYTES,
   })
 
-  if (!respuesta.ok) throw new Error(`AnimeAV1 respondió ${respuesta.status} en ${ruta}`)
+  if (!esEstadoOk(respuesta)) throw new Error(`AnimeAV1 respondió ${respuesta.status} en ${ruta}`)
 
   const crudo = await cuerpo(respuesta)
   try {
@@ -260,53 +284,28 @@ function rutaDe(valor: string): string {
 }
 
 /**
- * Tope del cuerpo de una respuesta.
+ * Tope del cuerpo que el plugin **pide** a la capacidad, en bytes.
  *
- * Un sitio hostil puede contestar con gigabytes y `text()` los materializa
- * enteros en el proceso que sirve la aplicación. Ocho megas son más que cualquier
- * `__data.json` o página de embed de este sitio, y menos que lo que hace daño.
- * La cabecera `content-length` se mira como aviso, pero la cuenta que manda es la
- * de los bytes que llegan: puede faltar o venir comprimida.
+ * El motor aplica el suyo por debajo y corta mientras llega; este es el que
+ * declara el plugin para que el corte sea el de siempre. Un sitio hostil puede
+ * contestar con gigabytes, y materializarlos en el proceso que sirve la
+ * aplicación es justo lo que este número evita.
  */
 const TOPE_CUERPO_BYTES = 8 * 1024 * 1024
 
-/** El texto de una respuesta, cortando si pasa del tope. */
-async function cuerpo(respuesta: Response): Promise<string> {
-  const declarado = Number(respuesta.headers.get('content-length') ?? '')
-  if (Number.isFinite(declarado) && declarado > TOPE_CUERPO_BYTES) {
-    throw new Error(`la respuesta declara ${declarado} bytes y el tope es ${TOPE_CUERPO_BYTES}`)
+/**
+ * El texto de una respuesta, ya descomprimido y ya acotado por el motor.
+ *
+ * El tope lo aplica la capacidad —`maxBytes` en cada petición— y llega contado
+ * en bytes, así que esta cuenta de caracteres es la **segunda** defensa y no la
+ * única: si el motor dejara de cortar, el plugin sigue cortando por su cuenta.
+ */
+async function cuerpo(respuesta: PluginResponse): Promise<string> {
+  if (respuesta.body.length > TOPE_CUERPO_BYTES) {
+    throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} caracteres y se corta`)
   }
 
-  const lector = respuesta.body?.getReader()
-  if (lector === undefined) return ''
-
-  const trozos: Uint8Array[] = []
-  let total = 0
-
-  for (;;) {
-    const { done, value } = await lector.read()
-    if (done === true) break
-    if (value === undefined) continue
-
-    total += value.byteLength
-    if (total > TOPE_CUERPO_BYTES) {
-      // Se corta sin terminar de leer y se suelta el cuerpo, para no dejar la
-      // conexión abierta con el sitio.
-      await lector.cancel().catch(() => undefined)
-      throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} bytes y se corta`)
-    }
-
-    trozos.push(value)
-  }
-
-  const unido = new Uint8Array(total)
-  let desplazamiento = 0
-  for (const trozo of trozos) {
-    unido.set(trozo, desplazamiento)
-    desplazamiento += trozo.byteLength
-  }
-
-  return new TextDecoder().decode(unido)
+  return respuesta.body
 }
 
 /**
@@ -528,18 +527,17 @@ async function fuenteDeEmbed(
 
   let html: string
   try {
-    const respuesta = await fetch(url, {
-      redirect: 'follow',
+    const respuesta = await redDe(opciones)(url, {
       headers: {
         accept: 'text/html,application/xhtml+xml',
         'accept-language': 'es-ES,es;q=0.9',
         referer: `${BASE}/`,
         'user-agent': AGENTE,
       },
-      signal: senalDe(opciones),
+      maxBytes: TOPE_CUERPO_BYTES,
     })
 
-    if (!respuesta.ok) return undefined
+    if (!esEstadoOk(respuesta)) return undefined
     html = await cuerpo(respuesta)
   } catch {
     return undefined

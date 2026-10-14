@@ -2,9 +2,11 @@
  * La regla que hace posible el aislamiento: un plugin sale a la red por la
  * capacidad que le da el motor, no por el `fetch` global.
  *
- * Hoy los seis lo usan directamente, así que hay una **línea base** con las
- * llamadas que quedan. La prueba falla si aparece una nueva y avisa cuando baja,
- * que es lo que hará la migración a la capacidad inyectada hasta dejarla en cero.
+ * Los seis ya están migrados, así que la línea base es **cero**: cualquier
+ * llamada nueva al `fetch` global deja esta prueba en rojo. No es una regla de
+ * estilo: la capacidad es la que aplica la lista blanca de destinos, resuelve el
+ * nombre una vez y fija la dirección, y salir por el global es saltarse las tres
+ * cosas sin que nadie lo mire.
  */
 import { describe, expect, test } from 'bun:test'
 import { readdirSync, readFileSync } from 'node:fs'
@@ -12,14 +14,14 @@ import { join } from 'node:path'
 
 const DIRECTORIO = join(import.meta.dir, '..', '..', 'providers')
 
-/** Llamadas al `fetch` global que quedan, por archivo. */
+/** Llamadas al `fetch` global que quedan, por archivo. Cero, y se defiende. */
 const LINEA_BASE: Readonly<Record<string, number>> = {
-  'animeav1.ts': 2,
-  'animex.ts': 1,
-  'cuevana3.ts': 1,
-  'gnula.ts': 1,
-  'jkanime.ts': 1,
-  'pelisplushd.ts': 1,
+  'animeav1.ts': 0,
+  'animex.ts': 0,
+  'cuevana3.ts': 0,
+  'gnula.ts': 0,
+  'jkanime.ts': 0,
+  'pelisplushd.ts': 0,
 }
 
 /** Un `fetch(` que no venga de una propiedad: `opciones.fetch(` no cuenta. */
@@ -44,6 +46,18 @@ describe('ningún plugin llama al `fetch` global', () => {
   test('ningún plugin toca `globalThis.fetch`', () => {
     for (const archivo of readdirSync(DIRECTORIO).filter((uno) => uno.endsWith('.ts'))) {
       expect(fuenteDe(archivo)).not.toContain('globalThis.fetch')
+    }
+  })
+
+  /**
+   * La mitad positiva de la regla: no basta con no llamar al global, hay que
+   * salir por la capacidad. Sin esta comprobación, un plugin que dejara de salir
+   * a la red —o que volviera al global con una llamada que el patrón no ve—
+   * pasaría la primera mitad sin que nadie lo notara.
+   */
+  test('los seis leen la capacidad del motor', () => {
+    for (const archivo of Object.keys(LINEA_BASE)) {
+      expect(/opciones\.fetch|options\.fetch/.test(fuenteDe(archivo))).toBe(true)
     }
   })
 

@@ -26,7 +26,7 @@
  * se resuelve es peor que uno que no está.
  */
 
-import type { CallOptions, Provider, ProviderResponse } from '@nn-anime/provider-sdk'
+import type { CallOptions, PluginFetch, PluginResponse, Provider, ProviderResponse } from '@nn-anime/provider-sdk'
 
 /*
  * Los tipos del dominio, nombrados aquí y no importados de `@nn-anime/core`: el
@@ -59,15 +59,6 @@ const IMAGENES_TMDB = 'https://image.tmdb.org/t/p/w500'
 
 const AGENTE =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0'
-
-const TIMEOUT_POR_DEFECTO_MS = 8000
-
-/**
- * El plazo del resolutor, más largo que el de una búsqueda: resolver un enlace
- * son varias peticiones encadenadas y el `timeoutMs` del contrato es una
- * sugerencia, no una carrera que haya que ganar.
- */
-const TIMEOUT_RESOLUTOR_MS = 20_000
 
 /** El idioma con el que el propio sitio pide a TMDB: español latinoamericano. */
 const IDIOMA = 'es-MX'
@@ -220,63 +211,56 @@ function comoUrl(valor: string | undefined): string | undefined {
 }
 
 /**
- * Tope del cuerpo de una respuesta.
+ * Tope del cuerpo que el plugin **pide** a la capacidad, en bytes.
  *
- * Un sitio hostil puede contestar con gigabytes y `text()` los materializa enteros
- * en el proceso que sirve la aplicación. Ocho megas son más que cualquier página
- * o bundle de este sitio —el paquete de MoviesAPI es de un mega— y menos que lo
- * que hace daño. La cabecera `content-length` se mira como aviso, pero la cuenta
- * que manda es la de los bytes que llegan: puede faltar o venir comprimida.
+ * El motor aplica el suyo por debajo y corta mientras llega; este es el que
+ * declara el plugin para que el corte sea el de siempre. Un sitio hostil puede
+ * contestar con gigabytes, y materializarlos en el proceso que sirve la
+ * aplicación es justo lo que este número evita.
  */
 const TOPE_CUERPO_BYTES = 8 * 1024 * 1024
 
-/** El texto de una respuesta, cortando si pasa del tope. */
-async function cuerpo(respuesta: Response): Promise<string> {
-  const declarado = Number(respuesta.headers.get('content-length') ?? '')
-  if (Number.isFinite(declarado) && declarado > TOPE_CUERPO_BYTES) {
-    throw new Error(`la respuesta declara ${declarado} bytes y el tope es ${TOPE_CUERPO_BYTES}`)
+/**
+ * El texto de una respuesta, ya descomprimido y ya acotado por el motor.
+ *
+ * El tope lo aplica la capacidad —`maxBytes` en cada petición— y llega contado
+ * en bytes, así que esta cuenta de caracteres es la **segunda** defensa y no la
+ * única: si el motor dejara de cortar, el plugin sigue cortando por su cuenta.
+ */
+async function cuerpo(respuesta: PluginResponse): Promise<string> {
+  if (respuesta.body.length > TOPE_CUERPO_BYTES) {
+    throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} caracteres y se corta`)
   }
 
-  const lector = respuesta.body?.getReader()
-  if (lector === undefined) return ''
-
-  const trozos: Uint8Array[] = []
-  let total = 0
-
-  for (;;) {
-    const { done, value } = await lector.read()
-    if (done === true) break
-    if (value === undefined) continue
-
-    total += value.byteLength
-    if (total > TOPE_CUERPO_BYTES) {
-      // Se corta sin terminar de leer y se suelta el cuerpo, para no dejar la
-      // conexión abierta con el sitio.
-      await lector.cancel().catch(() => undefined)
-      throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} bytes y se corta`)
-    }
-
-    trozos.push(value)
-  }
-
-  const unido = new Uint8Array(total)
-  let desplazamiento = 0
-  for (const trozo of trozos) {
-    unido.set(trozo, desplazamiento)
-    desplazamiento += trozo.byteLength
-  }
-
-  return new TextDecoder().decode(unido)
+  return respuesta.body
 }
 
 /* ------------------------------------------------------------------ peticiones */
 
-/** Une la cancelación del motor con el plazo de esta petición. */
-function senalDe(opciones: CallOptions, ms: number): AbortSignal {
-  const plazo = AbortSignal.timeout(ms > 0 ? ms : TIMEOUT_POR_DEFECTO_MS)
-  const unir = (AbortSignal as unknown as { any?: (senales: AbortSignal[]) => AbortSignal }).any
+/**
+ * La puerta a la red de esta llamada.
+ *
+ * Sale de `CallOptions.fetch`, la capacidad que el motor pone **siempre**: es la
+ * que aplica la lista blanca de destinos, resuelve el nombre una vez, fija la
+ * dirección a la que se conecta y acota el cuerpo. Antes esto era el `fetch`
+ * global y el plazo lo ponía el plugin; ahora lo pone el motor, por petición.
+ *
+ * Falla cerrado si no está —un motor viejo, o una prueba que no la ponga— en vez
+ * de caer al `fetch` global, que se saltaría la política de destinos: que un
+ * plugin la use tiene que ser una decisión visible, no un descuido.
+ */
+function redDe(opciones: CallOptions): PluginFetch {
+  const red = opciones.fetch
+  if (red === undefined) {
+    throw new Error('este motor no ofrece la capacidad de red; actualiza nn-anime')
+  }
 
-  return typeof unir === 'function' ? unir([opciones.signal, plazo]) : plazo
+  return red
+}
+
+/** Un estado 2xx, que es lo que el `Response` de la API web llamaba `ok`. */
+function esEstadoOk(respuesta: PluginResponse): boolean {
+  return respuesta.status >= 200 && respuesta.status < 300
 }
 
 interface ExtraDePeticion {
@@ -307,13 +291,11 @@ async function pedir(
   url: string,
   opciones: CallOptions,
   extra: ExtraDePeticion = {},
-  ms = TIMEOUT_POR_DEFECTO_MS,
   acepta = 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
-): Promise<Response> {
-  let respuesta: Response
+): Promise<PluginResponse> {
+  let respuesta: PluginResponse
   try {
-    respuesta = await fetch(url, {
-      redirect: 'follow',
+    respuesta = await redDe(opciones)(url, {
       headers: {
         accept: acepta,
         'accept-language': 'es-MX,es;q=0.9',
@@ -321,16 +303,16 @@ async function pedir(
         ...(extra.referer === undefined ? {} : { referer: extra.referer }),
         ...extra.cabeceras,
       },
-      signal: senalDe(opciones, ms),
+      maxBytes: TOPE_CUERPO_BYTES,
     })
   } catch (causa) {
-    if (causa instanceof Error && causa.name === 'AbortError') throw causa
+    if (opciones.signal.aborted) throw causa
 
     const motivo = causa instanceof Error ? causa.message : String(causa)
     throw new Error(`no se pudo contactar con ${sinCredenciales(url)}: ${motivo}; ${SUGERENCIA}`)
   }
 
-  if (!respuesta.ok && extra.tolerarEstado !== true) {
+  if (!esEstadoOk(respuesta) && extra.tolerarEstado !== true) {
     throw new Error(
       `${new URL(url).host} respondió ${respuesta.status} en ${sinCredenciales(url)}`,
     )
@@ -506,7 +488,6 @@ async function tmdb(
   clave: string,
   opciones: CallOptions,
   parametros: Record<string, string> = {},
-  ms = TIMEOUT_POR_DEFECTO_MS,
 ): Promise<Record<string, unknown>> {
   const url = `${TMDB}${ruta}?${new URLSearchParams({
     api_key: clave,
@@ -514,7 +495,7 @@ async function tmdb(
     ...parametros,
   }).toString()}`
 
-  const respuesta = await pedir(url, opciones, {}, ms, 'application/json')
+  const respuesta = await pedir(url, opciones, {}, 'application/json')
   const crudo = await cuerpo(respuesta)
   try {
     return JSON.parse(crudo) as Record<string, unknown>
@@ -778,7 +759,6 @@ async function resolverMoviesApi(
       cabeceras: { origin: 'https://moviesapi.to', 'x-player-key': clave },
       tolerarEstado: true,
     },
-    TIMEOUT_RESOLUTOR_MS,
     'application/json',
   )
 
@@ -837,7 +817,6 @@ async function resolverVixsrc(
     `https://vixsrc.to/api/${tipo}`,
     opciones,
     { referer: pagina, tolerarEstado: true },
-    TIMEOUT_RESOLUTOR_MS,
     'application/json',
   )
   let datos: { src?: string; error?: string }
@@ -865,7 +844,7 @@ async function resolverVixsrc(
     throw new Error('el reproductor no publicó una dirección que se pueda pedir')
   }
 
-  const html = await cuerpo(await pedir(embed, opciones, { referer: pagina }, TIMEOUT_RESOLUTOR_MS))
+  const html = await cuerpo(await pedir(embed, opciones, { referer: pagina }))
 
   const marca = html.indexOf('window.masterPlaylist')
   if (marca < 0) throw new Error('el reproductor no publicó su manifiesto; el marcado cambió')
@@ -1061,7 +1040,6 @@ const proveedor: Provider = {
         clave,
         opciones,
         {},
-        TIMEOUT_RESOLUTOR_MS,
       )) as FilaTmdb
 
       for (const episodio of detalle.episodes ?? []) {

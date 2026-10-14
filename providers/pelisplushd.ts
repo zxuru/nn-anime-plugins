@@ -17,7 +17,7 @@
  */
 
 import { createDecipheriv, createHash } from 'node:crypto'
-import type { CallOptions, Provider, ProviderResponse } from '@nn-anime/provider-sdk'
+import type { CallOptions, PluginFetch, PluginResponse, Provider, ProviderResponse } from '@nn-anime/provider-sdk'
 
 /*
  * Los tipos del dominio, nombrados aquí y no importados de `@nn-anime/core`.
@@ -49,20 +49,6 @@ const VARIABLE_DE_ENTORNO = 'NN_ANIME_PELISPLUS_URL'
 /** El sitio devuelve 403 sin referrer: no es una cabecera opcional. */
 const AGENTE =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0'
-
-/** Lo que se usa si el llamante no sugiere nada. */
-const TIMEOUT_POR_DEFECTO_MS = 8000
-
-/**
- * El plazo del resolutor, que es más largo que el de una búsqueda.
- *
- * Resolver un enlace son hasta seis peticiones encadenadas —página, embed,
- * espejo, manifiesto— y el `timeoutMs` del contrato es una **sugerencia**: la
- * ruta de stream no impone ninguna carrera, así que acortar aquí sólo sirve para
- * fallar en un sitio que sí funciona. Cada petición lleva su propio plazo, que es
- * lo que evita que una colgada se lleve por delante a las demás.
- */
-const TIMEOUT_RESOLUTOR_MS = 20_000
 
 /** Intentos de la prueba de trabajo. El mismo tope que usa `ani-cli-mx-core`. */
 const POW_LIMITE = 200_000
@@ -224,67 +210,60 @@ function rutaDe(valor: string): string {
 }
 
 /**
- * Tope del cuerpo de una respuesta.
+ * Tope del cuerpo que el plugin **pide** a la capacidad, en bytes.
  *
- * Un sitio hostil puede contestar con gigabytes y `text()` los materializa enteros
- * en el proceso que sirve la aplicación. Ocho megas son más que cualquier ficha,
- * página de embed o manifiesto de este sitio, y menos que lo que hace daño. La
- * cabecera `content-length` se mira como aviso, pero la cuenta que manda es la de
- * los bytes que llegan: puede faltar o venir comprimida.
+ * El motor aplica el suyo por debajo y corta mientras llega; este es el que
+ * declara el plugin para que el corte sea el de siempre. Un sitio hostil puede
+ * contestar con gigabytes, y materializarlos en el proceso que sirve la
+ * aplicación es justo lo que este número evita.
  */
 const TOPE_CUERPO_BYTES = 8 * 1024 * 1024
 
-/** El texto de una respuesta, cortando si pasa del tope. */
-async function cuerpo(respuesta: Response): Promise<string> {
-  const declarado = Number(respuesta.headers.get('content-length') ?? '')
-  if (Number.isFinite(declarado) && declarado > TOPE_CUERPO_BYTES) {
-    throw new Error(`la respuesta declara ${declarado} bytes y el tope es ${TOPE_CUERPO_BYTES}`)
+/**
+ * El texto de una respuesta, ya descomprimido y ya acotado por el motor.
+ *
+ * El tope lo aplica la capacidad —`maxBytes` en cada petición— y llega contado
+ * en bytes, así que esta cuenta de caracteres es la **segunda** defensa y no la
+ * única: si el motor dejara de cortar, el plugin sigue cortando por su cuenta.
+ */
+async function cuerpo(respuesta: PluginResponse): Promise<string> {
+  if (respuesta.body.length > TOPE_CUERPO_BYTES) {
+    throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} caracteres y se corta`)
   }
 
-  const lector = respuesta.body?.getReader()
-  if (lector === undefined) return ''
-
-  const trozos: Uint8Array[] = []
-  let total = 0
-
-  for (;;) {
-    const { done, value } = await lector.read()
-    if (done === true) break
-    if (value === undefined) continue
-
-    total += value.byteLength
-    if (total > TOPE_CUERPO_BYTES) {
-      // Se corta sin terminar de leer y se suelta el cuerpo, para no dejar la
-      // conexión abierta con el sitio.
-      await lector.cancel().catch(() => undefined)
-      throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} bytes y se corta`)
-    }
-
-    trozos.push(value)
-  }
-
-  const unido = new Uint8Array(total)
-  let desplazamiento = 0
-  for (const trozo of trozos) {
-    unido.set(trozo, desplazamiento)
-    desplazamiento += trozo.byteLength
-  }
-
-  return new TextDecoder().decode(unido)
+  return respuesta.body
 }
 
 /* --------------------------------------------------------------- texto y HTML */
 
-/** Une la cancelación del motor con el plazo de esta petición. */
-function senalDe(opciones: CallOptions, ms: number): AbortSignal {
-  const plazo = AbortSignal.timeout(ms > 0 ? ms : TIMEOUT_POR_DEFECTO_MS)
-  const unir = (AbortSignal as unknown as { any?: (senales: AbortSignal[]) => AbortSignal }).any
+/**
+ * La puerta a la red de esta llamada.
+ *
+ * Sale de `CallOptions.fetch`, la capacidad que el motor pone **siempre**: es la
+ * que aplica la lista blanca de destinos, resuelve el nombre una vez, fija la
+ * dirección a la que se conecta y acota el cuerpo. Antes esto era el `fetch`
+ * global y el plazo lo ponía el plugin; ahora lo pone el motor, por petición.
+ *
+ * Falla cerrado si no está —un motor viejo, o una prueba que no la ponga— en vez
+ * de caer al `fetch` global, que se saltaría la política de destinos: que un
+ * plugin la use tiene que ser una decisión visible, no un descuido.
+ */
+function redDe(opciones: CallOptions): PluginFetch {
+  const red = opciones.fetch
+  if (red === undefined) {
+    throw new Error('este motor no ofrece la capacidad de red; actualiza nn-anime')
+  }
 
-  return typeof unir === 'function' ? unir([opciones.signal, plazo]) : plazo
+  return red
+}
+
+/** Un estado 2xx, que es lo que el `Response` de la API web llamaba `ok`. */
+function esEstadoOk(respuesta: PluginResponse): boolean {
+  return respuesta.status >= 200 && respuesta.status < 300
 }
 
 interface ExtraDePeticion {
-  readonly metodo?: string
+  readonly metodo?: 'GET' | 'POST'
   readonly referer?: string
 }
 
@@ -310,24 +289,22 @@ async function pedir(
   url: string,
   opciones: CallOptions,
   extra: ExtraDePeticion = {},
-  ms = TIMEOUT_POR_DEFECTO_MS,
-): Promise<Response> {
-  let respuesta: Response
+): Promise<PluginResponse> {
+  let respuesta: PluginResponse
   try {
-    respuesta = await fetch(url, {
+    respuesta = await redDe(opciones)(url, {
       method: extra.metodo ?? 'GET',
-      redirect: 'follow',
       headers: {
         accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
         'accept-language': 'es-ES,es;q=0.9',
         'user-agent': AGENTE,
         referer: extra.referer ?? `${base()}/`,
       },
-      signal: senalDe(opciones, ms),
+      maxBytes: TOPE_CUERPO_BYTES,
     })
   } catch (causa) {
     // La cancelación del usuario no es un dominio caído: se deja pasar tal cual.
-    if (causa instanceof Error && causa.name === 'AbortError') throw causa
+    if (opciones.signal.aborted) throw causa
 
     const motivo = causa instanceof Error ? causa.message : String(causa)
     throw new Error(`no se pudo contactar con ${sinCredenciales(url)}: ${motivo}; ${SUGERENCIA}`)
@@ -337,7 +314,7 @@ async function pedir(
   // 404 en su destino, y lo que hay que contarle a quien lo sufre es que el
   // dominio ya no es el sitio, no el 404 de una dirección que él no pidió.
   verificarMismoHost(url, respuesta)
-  if (!respuesta.ok) {
+  if (!esEstadoOk(respuesta)) {
     throw new Error(`PelisPlusHD respondió ${respuesta.status} en ${sinCredenciales(url)}`)
   }
 
@@ -345,7 +322,7 @@ async function pedir(
 }
 
 /** Que una página del sitio siga en el sitio, y no en la de quien lo retiró. */
-function verificarMismoHost(url: string, respuesta: Response): void {
+function verificarMismoHost(url: string, respuesta: PluginResponse): void {
   let pedido: URL
   let servido: URL
   try {
@@ -758,7 +735,7 @@ async function medioDelEspejo(
     throw new Error('el espejo apunta a un destino interno o no es http(s); se descarta')
   }
 
-  const respuesta = await pedir(url, opciones, { referer }, TIMEOUT_RESOLUTOR_MS)
+  const respuesta = await pedir(url, opciones, { referer })
   const html = await cuerpo(respuesta)
   const desempaquetado = desempaquetar(html) ?? html
   const medio = primerMedio(desempaquetado)

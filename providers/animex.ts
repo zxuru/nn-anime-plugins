@@ -25,7 +25,7 @@
  * confiar en uno.
  */
 
-import type { CallOptions, Provider, ProviderResponse } from '@nn-anime/provider-sdk'
+import type { CallOptions, PluginFetch, PluginResponse, Provider, ProviderResponse } from '@nn-anime/provider-sdk'
 
 /*
  * Los tipos del dominio, derivados de los schemas de respuesta del SDK: el
@@ -51,7 +51,6 @@ const REFR = 'https://animex.one'
 const AGENTE =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0'
 
-const TIMEOUT_POR_DEFECTO_MS = 8000
 
 /** Cuántos resultados se piden al buscador. El de ani-cli-mx pide 12. */
 const LIMITE_BUSQUEDA = 24
@@ -96,16 +95,34 @@ const ENTIDADES: Readonly<Record<string, string>> = {
 
 /* ------------------------------------------------------------------- red */
 
-function senalDe(opciones: CallOptions): AbortSignal {
-  const ms = opciones.timeoutMs > 0 ? opciones.timeoutMs : TIMEOUT_POR_DEFECTO_MS
-  const plazo = AbortSignal.timeout(ms)
-  const unir = (AbortSignal as unknown as { any?: (senales: AbortSignal[]) => AbortSignal }).any
+/**
+ * La puerta a la red de esta llamada.
+ *
+ * Sale de `CallOptions.fetch`, la capacidad que el motor pone **siempre**: es la
+ * que aplica la lista blanca de destinos, resuelve el nombre una vez, fija la
+ * dirección a la que se conecta y acota el cuerpo. Antes esto era el `fetch`
+ * global y el plazo lo ponía el plugin; ahora lo pone el motor, por petición.
+ *
+ * Falla cerrado si no está —un motor viejo, o una prueba que no la ponga— en vez
+ * de caer al `fetch` global, que se saltaría la política de destinos: que un
+ * plugin la use tiene que ser una decisión visible, no un descuido.
+ */
+function redDe(opciones: CallOptions): PluginFetch {
+  const red = opciones.fetch
+  if (red === undefined) {
+    throw new Error('este motor no ofrece la capacidad de red; actualiza nn-anime')
+  }
 
-  return typeof unir === 'function' ? unir([opciones.signal, plazo]) : plazo
+  return red
+}
+
+/** Un estado 2xx, que es lo que el `Response` de la API web llamaba `ok`. */
+function esEstadoOk(respuesta: PluginResponse): boolean {
+  return respuesta.status >= 200 && respuesta.status < 300
 }
 
 interface ExtraDePeticion {
-  readonly metodo?: string
+  readonly metodo?: 'GET' | 'POST'
   readonly cuerpo?: string
 }
 
@@ -114,9 +131,8 @@ async function pedir(
   opciones: CallOptions,
   extra: ExtraDePeticion = {},
 ): Promise<string> {
-  const respuesta = await fetch(url, {
+  const respuesta = await redDe(opciones)(url, {
     method: extra.metodo ?? 'GET',
-    redirect: 'follow',
     headers: {
       accept: 'application/json',
       'content-type': 'application/json',
@@ -127,62 +143,37 @@ async function pedir(
       origin: REFR,
     },
     ...(extra.cuerpo === undefined ? {} : { body: extra.cuerpo }),
-    signal: senalDe(opciones),
+    maxBytes: TOPE_CUERPO_BYTES,
   })
 
-  if (!respuesta.ok) throw new Error(`AnimeX respondió ${respuesta.status} en ${url}`)
+  if (!esEstadoOk(respuesta)) throw new Error(`AnimeX respondió ${respuesta.status} en ${url}`)
 
   return await cuerpo(respuesta)
 }
 
 /**
- * Tope del cuerpo de una respuesta.
+ * Tope del cuerpo que el plugin **pide** a la capacidad, en bytes.
  *
- * Un sitio hostil puede contestar con gigabytes y `text()` los materializa
- * enteros en el proceso que sirve la aplicación. Ocho megas son más que cualquier
- * respuesta de esta API, y menos que lo que hace daño. La cabecera
- * `content-length` se mira como aviso, pero la cuenta que manda es la de los
- * bytes que llegan: puede faltar o venir comprimida.
+ * El motor aplica el suyo por debajo y corta mientras llega; este es el que
+ * declara el plugin para que el corte sea el de siempre. Un sitio hostil puede
+ * contestar con gigabytes, y materializarlos en el proceso que sirve la
+ * aplicación es justo lo que este número evita.
  */
 const TOPE_CUERPO_BYTES = 8 * 1024 * 1024
 
-/** El texto de una respuesta, cortando si pasa del tope. */
-async function cuerpo(respuesta: Response): Promise<string> {
-  const declarado = Number(respuesta.headers.get('content-length') ?? '')
-  if (Number.isFinite(declarado) && declarado > TOPE_CUERPO_BYTES) {
-    throw new Error(`la respuesta declara ${declarado} bytes y el tope es ${TOPE_CUERPO_BYTES}`)
+/**
+ * El texto de una respuesta, ya descomprimido y ya acotado por el motor.
+ *
+ * El tope lo aplica la capacidad —`maxBytes` en cada petición— y llega contado
+ * en bytes, así que esta cuenta de caracteres es la **segunda** defensa y no la
+ * única: si el motor dejara de cortar, el plugin sigue cortando por su cuenta.
+ */
+async function cuerpo(respuesta: PluginResponse): Promise<string> {
+  if (respuesta.body.length > TOPE_CUERPO_BYTES) {
+    throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} caracteres y se corta`)
   }
 
-  const lector = respuesta.body?.getReader()
-  if (lector === undefined) return ''
-
-  const trozos: Uint8Array[] = []
-  let total = 0
-
-  for (;;) {
-    const { done, value } = await lector.read()
-    if (done === true) break
-    if (value === undefined) continue
-
-    total += value.byteLength
-    if (total > TOPE_CUERPO_BYTES) {
-      // Se corta sin terminar de leer y se suelta el cuerpo, para no dejar la
-      // conexión abierta con el sitio.
-      await lector.cancel().catch(() => undefined)
-      throw new Error(`la respuesta pasa de ${TOPE_CUERPO_BYTES} bytes y se corta`)
-    }
-
-    trozos.push(value)
-  }
-
-  const unido = new Uint8Array(total)
-  let desplazamiento = 0
-  for (const trozo of trozos) {
-    unido.set(trozo, desplazamiento)
-    desplazamiento += trozo.byteLength
-  }
-
-  return new TextDecoder().decode(unido)
+  return respuesta.body
 }
 
 /** Una consulta al catálogo. Un error de GraphQL se cuenta con su mensaje. */

@@ -6,8 +6,8 @@
  * no es 2xx y un corte de red—. El motor redacta por **nombre de clave**, así que
  * una credencial dentro de una cadena sólo la quita quien la escribe.
  */
-import { afterEach, describe, expect, test } from 'bun:test'
-import { espiarFetch, opcionesDePrueba, type Espia } from './apoyo'
+import { describe, expect, test } from 'bun:test'
+import { espiarFetch, opcionesDePrueba, type RespuestaFalsa } from './apoyo'
 
 const proveedor = (await import('../../providers/cuevana3')).default
 
@@ -15,29 +15,19 @@ const CLAVE = 'abcdef0123456789abcdef0123456789'
 const BUNDLE = `var x = { ADSKEY: atob("${Buffer.from(CLAVE).toString('base64')}") };`
 const PAGINA = '<html><body><script src="/f0/1d9/tr/smartlinks/uno.js"></script></body></html>'
 
-let espia: Espia | undefined
-
-function montar(tmdb: () => Response): Espia {
-  const montado = espiarFetch((url) => {
-    if (url.pathname === '/inicio') return new Response(PAGINA)
-    if (url.pathname === '/f0/1d9/tr/smartlinks/uno.js') return new Response(BUNDLE)
+function montar(tmdb: () => RespuestaFalsa): ReturnType<typeof espiarFetch> {
+  return espiarFetch((url) => {
+    if (url.pathname === '/inicio') return { body: PAGINA }
+    if (url.pathname === '/f0/1d9/tr/smartlinks/uno.js') return { body: BUNDLE }
     if (url.host === 'api.themoviedb.org') return tmdb()
 
     return undefined
   })
-
-  espia = montado
-  return montado
 }
-
-afterEach(() => {
-  espia?.restaurar()
-  espia = undefined
-})
 
 describe('la clave de TMDB no viaja en el error', () => {
   test('ni con un estado que no es 2xx', async () => {
-    const { fetch } = montar(() => new Response('{"status_code":7}', { status: 401 }))
+    const { fetch } = montar(() => ({ body: '{"status_code":7}', status: 401 }))
 
     const fallo = await proveedor.search('avatar', opcionesDePrueba(fetch)).catch((causa) => causa)
 
@@ -57,7 +47,7 @@ describe('la clave de TMDB no viaja en el error', () => {
   })
 
   test('el mensaje sigue diciendo dónde falló', async () => {
-    const { fetch } = montar(() => new Response('nada', { status: 429 }))
+    const { fetch } = montar(() => ({ body: 'nada', status: 429 }))
 
     const fallo = String(
       await proveedor.search('avatar', opcionesDePrueba(fetch)).catch((causa) => causa),
