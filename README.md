@@ -166,23 +166,26 @@ una revisión futura sepa qué no se puede quitar sin querer:
 
 | Guarda | Dónde | Por qué |
 |---|---|---|
+| Salida a la red | `CallOptions.fetch`, en los seis | Es la capacidad del motor: lista blanca de destinos, el nombre resuelto **una vez** y la dirección fijada antes de conectar. El `fetch` global se saltaría las tres cosas, y `sin-fetch-global.test.ts` impide que vuelva |
 | Redacción de credenciales | `sinCredenciales()`, en los cuatro que meten una dirección en un mensaje | El motor redacta **por nombre de clave**: una credencial dentro de una cadena sólo la ve quien la escribe |
 | Destino del contenido | `destinoDeContenidoAceptable()`, en los cinco que siguen una dirección elegida por el sitio | Una página comprometida no puede hacer que el plugin pida tu router, tu `127.0.0.1` ni `169.254.169.254` |
-| Tope de cuerpo | `cuerpo()`, en los seis: 8 MiB | `text()` materializa en memoria lo que conteste el sitio |
+| Tope de cuerpo | `maxBytes` en cada petición, y `cuerpo()` lo vuelve a mirar | El motor corta por bytes **mientras llega**; la cuenta del plugin es la segunda defensa, no la única |
 | Dificultad acotada | `DIFICULTAD_MAXIMA`, en `pelisplushd` | `'0'.repeat(difficulty)` sin tope reserva gigabytes |
 | Rutas de referencia | `rutaDe()` | Un `..` no mueve la petición a otra ruta del sitio, y la del paginador lleva la sesión |
 | Cabeceras reenviadas | Lista blanca, en `animex` | Las cabeceras con las que se pide el medio no las elige un tercero |
 
-Dos límites que conviene saber, porque no se pueden cerrar desde un plugin:
+Dos límites que conviene saber:
 
-- La comprobación de destino es **literal**. Un nombre que resuelva a una dirección interna la
-  esquiva: resolver y fijar la dirección no está al alcance de un `fetch`. La guarda completa vive
-  en el motor, que sí resuelve y mira **todas** las respuestas del DNS. Al añadir una petición a una
-  dirección que elige el sitio, se usan las funciones que ya están.
+- La comprobación de destino del plugin es **literal**: descarta lo que se ve en la cadena, sin
+  resolver el nombre. Ya no es la única —toda petición sale por `CallOptions.fetch`, y esa capacidad
+  resuelve el nombre, mira **todas** sus direcciones y fija la dirección antes de conectar—, pero se
+  queda como primer filtro, que es barato y explica el motivo del descarte. Al añadir una petición a
+  una dirección que elige el sitio, se usan las funciones que ya están.
 - La **excepción de la base interna**: si apuntas la dirección del sitio a tu propia máquina
-  (`NN_ANIME_PELISPLUS_URL`, `NN_ANIME_GNULA_URL`, `NN_ANIME_CUEVANA3_URL`), la guarda se relaja,
-  porque entonces la red interna *es* el sitio. Es para trabajar contra un sitio falso local; con la
-  base pública, no se relaja nunca.
+  (`NN_ANIME_PELISPLUS_URL`, `NN_ANIME_GNULA_URL`, `NN_ANIME_CUEVANA3_URL`), la guarda del plugin se
+  relaja, porque entonces la red interna *es* el sitio. Es para trabajar contra un sitio falso local;
+  con la base pública, no se relaja nunca. Con la capacidad del motor hace falta además
+  `NN_ANIME_ALLOW_LOOPBACK`, que el arranque anuncia en el registro.
 
 ### Integridad de lo que copias
 
@@ -200,12 +203,15 @@ ejecuta puede cambiar sin que hagas nada.
 
 ### Si quieres aislarlos
 
-Copiar sólo lo que hayas leído es la mitigación barata. La cara es sacar los plugins del proceso de
-la aplicación —que es lo que hoy no se hace— y darles una capacidad de red acotada: un proceso
-aparte, sin acceso directo a la red, que salga por un proxy con la comprobación de destinos del
-motor, con tope de memoria y de tiempo por llamada. Un sandbox que sólo aísle el sistema de archivos
-no cambia nada aquí, porque el riesgo de estos archivos no es el disco: es a dónde se les puede
-mandar y cuánto se les puede hacer tragar.
+Copiar sólo lo que hayas leído es la mitigación barata. La mitad de la cara ya está hecha: los seis
+salen a la red por la **capacidad del motor** —`CallOptions.fetch`—, con la lista blanca de destinos,
+el nombre resuelto una vez y la dirección fijada, así que a dónde se les puede mandar ya no lo decide
+cada archivo. Lo que falta es la otra mitad: **sacarlos del proceso** de la aplicación. El motor tiene
+el camino medido —un proceso *Node* con `--permission` y sin red, con el padre haciendo el HTTP por el
+hijo: 41 ms de arranque y 37 MiB— y el contrato está preparado para el puente, porque lo que cruza es
+clonable a propósito. Un sandbox que sólo aísle el sistema de archivos no cambia nada aquí, porque el
+riesgo de estos archivos no es el disco: es a dónde se les puede mandar y cuánto se les puede hacer
+tragar.
 
 ## Aviso
 

@@ -1,61 +1,73 @@
 /**
  * Lo que comparten las pruebas de seguridad.
  *
- * Intercepta el `fetch` global, que es la puerta que tienen hoy los plugins para
- * salir a la red, y **además** adjunta el falso a `CallOptions`: cuando el
- * contrato traiga la capacidad inyectada, el plugin leerá de ahí y la
- * intercepción del global se podrá quitar sin tocar las pruebas.
+ * Construye la **capacidad de red** de mentira que un plugin recibe en
+ * `CallOptions.fetch`, y ya no intercepta el `fetch` global: desde la migración
+ * los seis salen por la capacidad, y `sin-fetch-global.test.ts` impide que vuelva
+ * una llamada al global.
+ *
+ * La capacidad de verdad —la que aplica la lista blanca de destinos, resuelve el
+ * nombre y fija la dirección— vive en el motor y se prueba allí. Aquí la de
+ * mentira es **neutral a propósito**: no bloquea destinos internos, para que la
+ * prueba que los descarta siga midiendo la guarda del plugin y no la del motor.
  */
-import type { CallOptions } from '@nn-anime/provider-sdk'
+import type { CallOptions, PluginFetch } from '@nn-anime/provider-sdk'
 
-/** Un `fetch` de mentira que responde por ruta. Si devuelve `undefined`, es un 404. */
-export type Enrutador = (url: URL) => Response | undefined
+/** Una ruta de la tabla. Si el enrutador no la conoce, devuelve `undefined` y es un 404. */
+export interface RespuestaFalsa {
+  readonly body: string
+  readonly status?: number
+  readonly headers?: Readonly<Record<string, string>>
+  readonly setCookie?: readonly string[]
+  readonly url?: string
+}
+
+export type Enrutador = (url: URL) => RespuestaFalsa | undefined
+
+/** Una petición vista desde la prueba. */
+export interface Peticion {
+  readonly url: string
+  /** El tope que el plugin pidió para esa respuesta, si pidió alguno. */
+  readonly maxBytes: number | undefined
+}
 
 export interface Espia {
   /** Todas las direcciones que se llegaron a pedir, en orden. */
   readonly pedidas: readonly string[]
-  readonly fetch: typeof fetch
-  /** Devuelve el `fetch` de verdad al global. */
-  restaurar(): void
+  /** Las peticiones enteras, con el tope que declaró el plugin en cada una. */
+  readonly peticiones: readonly Peticion[]
+  /** La capacidad que se le pasa al plugin en `CallOptions`. */
+  readonly fetch: PluginFetch
 }
 
-/** Sustituye el `fetch` global por uno que no sale a la red. */
+/** Una capacidad de mentira que responde por ruta y no sale a la red. */
 export function espiarFetch(enrutar: Enrutador): Espia {
   const pedidas: string[] = []
-  const original = globalThis.fetch
+  const peticiones: Peticion[] = []
 
-  const falso = (async (entrada: unknown): Promise<Response> => {
-    const url = new URL(typeof entrada === 'string' ? entrada : String(entrada))
+  const falso: PluginFetch = async (entrada, peticion) => {
+    const url = new URL(entrada)
     pedidas.push(url.href)
+    peticiones.push({ url: url.href, maxBytes: peticion?.maxBytes })
 
-    return enrutar(url) ?? new Response('no está', { status: 404 })
-  }) as typeof fetch
+    const respuesta = enrutar(url)
+    if (respuesta === undefined) {
+      return { status: 404, url: url.href, headers: {}, setCookie: [], body: 'no está' }
+    }
 
-  globalThis.fetch = falso
-
-  return {
-    pedidas,
-    fetch: falso,
-    restaurar: () => {
-      globalThis.fetch = original
-    },
+    return {
+      status: respuesta.status ?? 200,
+      url: respuesta.url ?? url.href,
+      headers: respuesta.headers ?? {},
+      setCookie: respuesta.setCookie ?? [],
+      body: respuesta.body,
+    }
   }
+
+  return { pedidas, peticiones, fetch: falso }
 }
 
-/**
- * Opciones de llamada con el `fetch` de la prueba dentro.
- *
- * El contrato **ya declara** `fetch`, pero no es lo mismo que se adjunta aquí: la
- * capacidad inyectada devuelve un `PluginResponse` —estado, cabeceras y `body` ya
- * leído— y el falso de estas pruebas devuelve un `Response` de verdad, que es lo
- * que los plugins siguen leyendo del global mientras la migración no esté hecha.
- * La aserción dice exactamente eso: lo que viaja en las opciones es el falso del
- * global, no un `PluginFetch`.
- */
-export function opcionesDePrueba(falso: typeof fetch, ms = 8000): CallOptions {
-  return {
-    signal: AbortSignal.timeout(ms),
-    timeoutMs: ms,
-    fetch: falso as unknown as CallOptions['fetch'],
-  }
+/** Las opciones de la llamada, con la capacidad de la prueba dentro. */
+export function opcionesDePrueba(red: PluginFetch, ms = 8000): CallOptions {
+  return { signal: AbortSignal.timeout(ms), timeoutMs: ms, fetch: red }
 }
