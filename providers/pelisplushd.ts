@@ -787,8 +787,20 @@ const proveedor: Provider = {
    * el sitio tiene portada de novedades, pero no se ha estudiado su marcado y
    * declarar una capacidad que no está probada ofrece un botón que no lleva a
    * ninguna parte.
+   *
+   * `media` en 'movies': es una fuente de lo que no es anime. Películas, series y
+   * doramas van por el mismo lado —el dorama es una serie más, y el tipo viaja en
+   * la ruta del enlace—, así que todo su catálogo cae en la pestaña de películas
+   * y ninguna de sus fichas se cuela en la de anime.
    */
-  capabilities: { search: true, sub: true, dub: true, trending: false, feed: false },
+  capabilities: {
+    search: true,
+    sub: true,
+    dub: true,
+    trending: false,
+    feed: false,
+    media: 'movies',
+  },
 
   /**
    * La búsqueda es una sola petición: el tipo ya viene en la ruta de cada enlace.

@@ -45,10 +45,17 @@ export function espiarFetch(enrutar: Enrutador): Espia {
 /**
  * Opciones de llamada con el `fetch` de la prueba dentro.
  *
- * `fetch` todavía no está en el contrato —lo estará—, así que se adjunta con una
- * aserción en vez de esperar a que el SDK lo declare. El global sigue mandando
- * hoy; cuando no, esta es la mitad que queda.
+ * El contrato **ya declara** `fetch`, pero no es lo mismo que se adjunta aquí: la
+ * capacidad inyectada devuelve un `PluginResponse` —estado, cabeceras y `body` ya
+ * leído— y el falso de estas pruebas devuelve un `Response` de verdad, que es lo
+ * que los plugins siguen leyendo del global mientras la migración no esté hecha.
+ * La aserción dice exactamente eso: lo que viaja en las opciones es el falso del
+ * global, no un `PluginFetch`.
  */
 export function opcionesDePrueba(falso: typeof fetch, ms = 8000): CallOptions {
-  return { signal: AbortSignal.timeout(ms), timeoutMs: ms, fetch: falso } as CallOptions
+  return {
+    signal: AbortSignal.timeout(ms),
+    timeoutMs: ms,
+    fetch: falso as unknown as CallOptions['fetch'],
+  }
 }

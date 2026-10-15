@@ -11,18 +11,32 @@ reales van aquí, separados a propósito.
 
 ## Qué hay
 
-| Id | Sitio | Buscar | Sub | Dub | Tendencias | Feed | Episodios por página |
-|---|---|---|---|---|---|---|---|
-| `jkanime` | [jkanime.net](https://jkanime.net) | sí | sí | no | sí | sí | sí |
-| `animeav1` | [animeav1.com](https://animeav1.com) | sí | sí | sí | sí | no | no |
-| `pelisplushd` | [pelisplushd.bz](https://pelisplushd.bz) | sí | sí | sí | no | no | no |
-| `animex` | [animex.one](https://animex.one) | sí | sí | sí | no | no | no |
-| `cuevana3` | [cuevana3play.pro](https://cuevana3play.pro) | sí | sí | no | no | no | no |
-| `gnula` | [www2.gnula.one](https://www2.gnula.one) | sí | sí | sí | no | no | no |
+| Id | Sitio | Sirve (`media`) | Buscar | Sub | Dub | Tendencias | Feed | Episodios por página |
+|---|---|---|---|---|---|---|---|---|
+| `jkanime` | [jkanime.net](https://jkanime.net) | `anime` | sí | sí | no | sí | sí | sí |
+| `animeav1` | [animeav1.com](https://animeav1.com) | `anime` | sí | sí | sí | sí | no | no |
+| `pelisplushd` | [pelisplushd.bz](https://pelisplushd.bz) | `movies` | sí | sí | sí | no | no | no |
+| `animex` | [animex.one](https://animex.one) | `anime` | sí | sí | sí | no | no | no |
+| `cuevana3` | [cuevana3play.pro](https://cuevana3play.pro) | `movies` | sí | sí | no | no | no | no |
+| `gnula` | [www2.gnula.one](https://www2.gnula.one) | `movies` | sí | sí | sí | no | no | no |
 
 Los seis son adaptadores de lectura: piden las páginas del sitio, extraen lo que el contrato pide y
 devuelven datos. Ninguno descarga, aloja ni redistribuye contenido, y ninguno guarda credenciales
 —no hay ninguna que guardar.
+
+Los seis declaran además `capabilities.media`, que es lo que nn-anime lee para saber **en qué mitad de
+la aplicación** se busca en cada fuente: `anime` en `jkanime`, `animeav1` y `animex`, y `movies` en
+`pelisplushd`, `cuevana3` y `gnula`. «Películas» es lo que **no** es anime —películas, series y
+doramas, que van por el mismo camino—, no sólo el cine. El campo es opcional y ausente significa
+`anime`, que es lo que eran los plugins de antes; aquí se escribe en los seis para que cada archivo
+diga lo que sirve sin que haya que deducirlo, y para que la tabla de arriba y el código no puedan
+decir cosas distintas.
+
+Una fuente que sirviera las dos cosas declararía `both` y repartiría por el `kind` de cada título, que
+es lo que distingue una película del resto. Ninguna de estas seis lo es: las tres de anime sirven
+anime y las tres de películas sirven lo demás. En `cuevana3` eso tiene una consecuencia que conviene
+saber: su catálogo es el de TMDB, así que el anime que TMDB tenga cae en la pestaña de películas,
+porque esa fuente no distingue uno de otro.
 
 `cuevana3` y `gnula` son los otros dos que sirven **películas**, y son sitios de español latino. Están
 hechos de formas opuestas, y eso se nota en lo que cada uno puede prometer:

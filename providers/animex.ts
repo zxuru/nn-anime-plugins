@@ -502,8 +502,17 @@ const proveedor: Provider = {
    * `trending` en falso aunque el catálogo tenga ordenaciones: no se ha medido
    * ninguna, y una capacidad declarada sin comprobar ofrece un botón que no lleva a
    * ninguna parte. `feed` tampoco: no hay lista de novedades con fecha.
+   * `media` en 'anime': el catálogo de la API es de anime, series y sus películas,
+   * así que lo suyo no entra en la pestaña de películas.
    */
-  capabilities: { search: true, sub: true, dub: true, trending: false, feed: false },
+  capabilities: {
+    search: true,
+    sub: true,
+    dub: true,
+    trending: false,
+    feed: false,
+    media: 'anime',
+  },
 
   /**
    * La búsqueda es una consulta al catálogo, y `searchAnime` está pensado para

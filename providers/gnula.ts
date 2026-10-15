@@ -1067,8 +1067,19 @@ const proveedor: Provider = {
    * Sin tendencias ni feed: tiene portada de novedades, pero este archivo no ha
    * estudiado su marcado y declarar una capacidad que no está probada ofrece un
    * botón que no lleva a ninguna parte.
+   *
+   * `media` en 'movies': este dominio sólo publica películas —sus series viven en
+   * otro suyo—, y de las que publica ninguna es anime, así que su lugar es la
+   * pestaña de películas y no la de anime.
    */
-  capabilities: { search: true, sub: true, dub: true, trending: false, feed: false },
+  capabilities: {
+    search: true,
+    sub: true,
+    dub: true,
+    trending: false,
+    feed: false,
+    media: 'movies',
+  },
 
   /**
    * La búsqueda es una sola petición, y el sitio no pagina los resultados.

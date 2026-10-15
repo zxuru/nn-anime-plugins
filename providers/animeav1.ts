@@ -587,7 +587,16 @@ const proveedor: Provider = {
   apiVersion: '1',
   // El sitio publica subtitulado y doblaje, y la home trae una lista curada.
   // No publica novedades con fecha propia, así que `feed` va en falso.
-  capabilities: { search: true, sub: true, dub: true, trending: true, feed: false },
+  // `media` en 'anime': sirve anime —series y las películas de esas series— y
+  // nada más, así que no toca la pestaña de películas.
+  capabilities: {
+    search: true,
+    sub: true,
+    dub: true,
+    trending: true,
+    feed: false,
+    media: 'anime',
+  },
 
   /**
    * La búsqueda es la única ruta JSON del sitio, y es un `POST`: la consulta va

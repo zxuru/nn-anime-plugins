@@ -919,8 +919,21 @@ const proveedor: Provider = {
    * Películas y series. Subtitulado sí: los servidores de este sitio entregan el
    * audio original con subtítulos en español (`&sub=es`, `&ds_lang=es`), no un
    * doblaje. Declarar `dub` ofrecería un botón que promete latino y da subtítulos.
+   *
+   * `media` en 'movies': el catálogo que se lee es el de TMDB —cine y televisión
+   * de todo tipo— y el sitio lo enseña como un escaparate de películas. Las
+   * fichas de anime que TMDB tenga caen de este lado, porque la fuente no las
+   * distingue: separarlas pediría un género que este archivo no puede deducir de
+   * lo que el contrato llama `kind`.
    */
-  capabilities: { search: true, sub: true, dub: false, trending: false, feed: false },
+  capabilities: {
+    search: true,
+    sub: true,
+    dub: false,
+    trending: false,
+    feed: false,
+    media: 'movies',
+  },
 
   /**
    * La búsqueda, contra el mismo TMDB que consulta el sitio.

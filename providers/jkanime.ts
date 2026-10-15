@@ -802,6 +802,8 @@ const jkanime: Provider = {
   // paginador del sitio permite pedir una página, un número y el último sin
   // traer el catálogo entero: una serie de mil doscientos episodios son 76
   // peticiones si se pide la lista completa, y esa ráfaga es la que responde 429.
+  // `media` en 'anime': el catálogo es de anime —series y las películas de esas
+  // series—, así que todo lo suyo cae del lado del anime.
   capabilities: {
     search: true,
     sub: true,
@@ -809,6 +811,7 @@ const jkanime: Provider = {
     trending: true,
     feed: true,
     episodePages: true,
+    media: 'anime',
   },
 
   async search(query, options) {
